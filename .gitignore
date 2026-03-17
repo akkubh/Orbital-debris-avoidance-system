@@ -1,1 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
 
+# Simulation state (runtime file, don't commit)
+sim_state.json
+
+# Environment
+.env
+.venv
+venv/
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
