@@ -54,6 +54,27 @@ def health():
     }
 
 
+
+# ── Debug: raw state dump ─────────────────────────────────────────────
+@app.get("/api/state")
+def raw_state():
+    """Shows everything currently in memory — useful for debugging."""
+    from models.state_store import state
+    return {
+        "sim_time":   state.sim_time,
+        "sim_epoch":  state.sim_epoch,
+        "satellites": {
+            id: {"r": obj.r, "v": obj.v, "fuel_kg": obj.fuel_kg, "status": obj.status}
+            for id, obj in state.objects.items() if obj.type == "SAT"
+        },
+        "debris": {
+            id: {"r": obj.r, "v": obj.v}
+            for id, obj in state.objects.items() if obj.type == "DEBRIS"
+        },
+        "pending_burns": len([b for b in state.burns if not b.executed]),
+        "cdm_warnings":  state.active_cdm_count(),
+    }
+
 if __name__ == "__main__":
     import uvicorn
     log.info("Starting ACM server on 0.0.0.0:8000")

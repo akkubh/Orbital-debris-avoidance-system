@@ -1,160 +1,217 @@
 """
-POST /api/telemetry
-Ingests orbital state vectors for satellites and debris.
-Updates in-memory state store asynchronously.
+api/telemetry.py
+━━━━━━━━━━━━━━━
+Telemetry Ingestion & Auto-Evasion for ACM (Autonomous Constellation Manager)
+National Space Hackathon 2026
+
+Uses exact schema names from models/schemas.py:
+    TelemetryRequest  — batch multi-object telemetry payload
+    TelemetryResponse — ACK response
+    BurnCommand       — individual burn instruction
+    Vec3              — 3D vector (x, y, z)
+
+CHANGES vs original:
+  • _auto_schedule_evasions() gates on risk_level:
+      LOW     → skip entirely (no burn)
+      MEDIUM  → log warning only
+      HIGH    → schedule evasion + recovery
+      CRITICAL→ run optimize_delta_v() first, then schedule
 """
+
+import uuid
 import logging
-from fastapi import APIRouter
-from datetime import datetime
+import numpy as np
+from datetime import datetime, timezone, timedelta
+from fastapi import APIRouter, HTTPException
 
-from models.schemas import TelemetryRequest, TelemetryResponse
-from models.state_store import state, SpaceObject, INITIAL_FUEL_KG, DRY_MASS_KG
+# ── Schema imports — exact names from models/schemas.py ──────────────────────
+from models.schemas import (
+    TelemetryRequest,
+    TelemetryResponse,
+    BurnCommand,
+    Vec3,
+)
+from models.state_store import state_store
 from physics.conjunction import screen_conjunctions
+from physics.maneuver_calc import plan_evasion_burn, plan_recovery_burn, optimize_delta_v
 
-router = APIRouter()
-log = logging.getLogger("telemetry")
+logger = logging.getLogger("ACM.Telemetry")
 
+router = APIRouter(tags=["Telemetry"])
+
+AUTO_EVASION_RISK_LEVELS = {"HIGH", "CRITICAL"}
+
+
+# ── Telemetry Ingestion Endpoint ──────────────────────────────────────────────
 
 @router.post("/api/telemetry", response_model=TelemetryResponse)
-async def receive_telemetry(payload: TelemetryRequest):
-    # Update simulation time on first telemetry or if advancing
-    if state.sim_time is None:
-        state.sim_time = payload.timestamp
-        log.info(f"Simulation initialized at {state.sim_time}")
+async def ingest_telemetry(payload: TelemetryRequest):
+    """
+    Ingest a batch of satellite + debris telemetry objects.
 
-    processed = 0
+    Each TelemetryObject has:
+        id   : str          — object identifier
+        type : "SAT"|"DEBRIS"
+        r    : Vec3         — position (km, ECI)
+        v    : Vec3         — velocity (km/s, ECI)
+    """
+    timestamp = payload.timestamp
+    sat_ids_ingested = []
+
     for obj in payload.objects:
-        existing = state.objects.get(obj.id)
+        position = obj.r.to_list()
+        velocity = obj.v.to_list()
 
-        if existing:
-            # Update position and velocity in-place
-            existing.r = obj.r.to_list()
-            existing.v = obj.v.to_list()
-        else:
-            # New object — create with defaults
-            new_obj = SpaceObject(
-                id   = obj.id,
-                type = obj.type,
-                r    = obj.r.to_list(),
-                v    = obj.v.to_list(),
+        if obj.type == "SAT":
+            state_store.update_satellite(
+                satellite_id=obj.id,
+                position=position,
+                velocity=velocity,
+                timestamp=timestamp,
             )
-            # Satellites get fuel + nominal slot (first known position)
-            if obj.type == "SAT":
-                new_obj.fuel_kg    = INITIAL_FUEL_KG
-                new_obj.dry_mass_kg = DRY_MASS_KG
-                new_obj.nominal_r  = obj.r.to_list()
-                new_obj.nominal_v  = obj.v.to_list()
-                log.info(f"New satellite registered: {obj.id}")
-            state.objects[obj.id] = new_obj
+            sat_ids_ingested.append(obj.id)
+            logger.info(f"[ACM] Telemetry ingested: SAT {obj.id}")
 
-        processed += 1
+        elif obj.type == "DEBRIS":
+            state_store.update_debris(
+                debris_id=obj.id,
+                position=position,
+                velocity=velocity,
+                timestamp=timestamp,
+            )
+            logger.debug(f"[ACM] Telemetry ingested: DEBRIS {obj.id}")
 
-    # Run conjunction screening after every telemetry batch
-    _refresh_cdm_warnings()
+    # Screen conjunctions once per batch
+    conjunction_events = screen_conjunctions(
+        satellites=state_store.satellites,
+        debris_objects=state_store.debris,
+    )
 
-    log.debug(f"Telemetry: {processed} objects, {state.active_cdm_count()} CDM warnings")
-    
-    from models.state_store import save_state
-    save_state()
+    total_evasions = 0
+    for sat_id in sat_ids_ingested:
+        total_evasions += _auto_schedule_evasions(conjunction_events, sat_id)
 
     return TelemetryResponse(
-        status              = "ACK",
-        processed_count     = processed,
-        active_cdm_warnings = state.active_cdm_count(),
+        status="ACK",
+        processed_count=len(payload.objects),
+        active_cdm_warnings=len(conjunction_events),
     )
-    
-    
 
 
-def _refresh_cdm_warnings():
-    """Re-run conjunction screening and update CDM list."""
-    sats   = state.get_satellites()
-    debris = state.get_debris()
+# ── Auto-Evasion Logic ────────────────────────────────────────────────────────
 
-    if not sats or not debris:
-        return
+def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) -> int:
+    """
+    Schedule evasion burns only for HIGH / CRITICAL risk events.
 
-    from physics.conjunction import screen_conjunctions
-    events = screen_conjunctions(sats, debris)
+    LOW    → skip
+    MEDIUM → log only
+    HIGH   → schedule evasion + recovery
+    CRITICAL → optimize ΔV first, then schedule
+    """
+    scheduled_count = 0
 
-    # Clear old unresolved warnings, add fresh ones
-    state.cdm_warnings = [w for w in state.cdm_warnings if w.resolved]
+    for event in conjunction_events:
+        if event.satellite_id != triggering_sat_id:
+            continue
 
-    for event in events:
-        from models.state_store import CDMWarning
-        state.cdm_warnings.append(CDMWarning(
-            sat_id           = event.sat_id,
-            deb_id           = event.deb_id,
-            tca_epoch        = state.sim_epoch + event.tca_offset_s,
-            miss_distance_km = event.miss_distance_km,
-        ))
-        log.warning(
-            f"CDM: {event.sat_id} ↔ {event.deb_id} | "
-            f"TCA in {event.tca_offset_s:.0f}s | "
-            f"miss {event.miss_distance_km*1000:.1f}m"
+        risk_level = getattr(event, "risk_level", "LOW")
+        risk_score = getattr(event, "risk_score",  0.0)
+
+        if risk_level == "LOW":
+            logger.info(
+                f"[ACM] Skipping LOW risk: {event.satellite_id} vs "
+                f"{event.debris_id} (score={risk_score:.4f})"
+            )
+            continue
+
+        if risk_level == "MEDIUM":
+            logger.warning(
+                f"[ACM] MEDIUM risk — monitoring: {event.satellite_id} vs "
+                f"{event.debris_id} | miss={event.miss_distance:.3f} km"
+            )
+            continue
+
+        # HIGH or CRITICAL
+        logger.warning(
+            f"[ACM] {risk_level} risk — scheduling evasion: "
+            f"{event.satellite_id} vs {event.debris_id} | "
+            f"miss={event.miss_distance:.3f} km | TCA={event.tca_seconds:.0f}s"
         )
 
-    # Auto-schedule evasion for critical conjunctions
-    _auto_schedule_evasions(events)
+        sat_state = state_store.satellites.get(event.satellite_id)
+        deb_state = state_store.debris.get(event.debris_id)
 
-
-def _auto_schedule_evasions(events):
-    """Automatically plan and queue evasion burns for unresolved conjunctions."""
-    from physics.maneuver_calc import plan_evasion_burn, plan_recovery_burn
-    from models.state_store import ScheduledBurn
-
-    for event in events:
-        sat = state.objects.get(event.sat_id)
-        if not sat or sat.type != "SAT":
+        if sat_state is None or deb_state is None:
+            logger.error(
+                f"[ACM] Missing state for {event.satellite_id} or "
+                f"{event.debris_id} — skipping"
+            )
             continue
 
-        # Don't re-plan if already scheduled
-        already_planned = any(
-            b.satellite_id == event.sat_id and not b.executed
-            for b in state.burns
+        sat_pos  = np.asarray(sat_state.r)
+        sat_vel  = np.asarray(sat_state.v)
+        deb_pos  = np.asarray(deb_state.r)
+        deb_vel  = np.asarray(deb_state.v)
+        dry_mass = getattr(sat_state, "dry_mass_kg", 500.0)
+
+        if risk_level == "CRITICAL":
+            optimal_dv = optimize_delta_v(
+                sat_pos, sat_vel, deb_pos, deb_vel,
+                tca_seconds=event.tca_seconds,
+                direction_name="TRANSVERSE",
+            )
+            if optimal_dv is not None:
+                logger.info(
+                    f"[ACM] Optimal ΔV = {optimal_dv * 1000:.1f} m/s "
+                    f"for {event.satellite_id}"
+                )
+
+        maneuver = plan_evasion_burn(
+            sat_pos, sat_vel, deb_pos, deb_vel,
+            tca_seconds=event.tca_seconds,
+            dry_mass_kg=dry_mass,
         )
-        if already_planned:
+
+        if maneuver is None:
+            logger.error(f"[ACM] Evasion planning failed for {event.satellite_id}")
             continue
 
-        evasion = plan_evasion_burn(sat, event.tca_offset_s,
-                                    event.miss_distance_km, state.sim_epoch)
-        if not evasion:
-            log.error(f"Could not plan evasion for {event.sat_id}")
-            continue
+        recovery_dv_arr = plan_recovery_burn(maneuver["dv_eci"])
 
-        # Queue evasion burn
-        state.burns.append(ScheduledBurn(
-            burn_id        = evasion["burn_id"],
-            satellite_id   = event.sat_id,
-            burn_time_iso  = _epoch_to_iso(evasion["burn_epoch"]),
-            burn_time_epoch = evasion["burn_epoch"],
-            delta_v_eci    = evasion["delta_v_eci"],
-        ))
+        evasion_time  = _iso_offset(event.tca_seconds * 0.5)
+        recovery_time = _iso_offset(event.tca_seconds * 1.5)
 
-        # Queue recovery burn
-        if sat.nominal_r:
-            recovery = plan_recovery_burn(sat, sat.nominal_r, sat.nominal_v,
-                                          evasion["burn_epoch"], state.sim_epoch)
-            if recovery:
-                state.burns.append(ScheduledBurn(
-                    burn_id         = recovery["burn_id"],
-                    satellite_id    = event.sat_id,
-                    burn_time_iso   = _epoch_to_iso(recovery["burn_epoch"]),
-                    burn_time_epoch = recovery["burn_epoch"],
-                    delta_v_eci     = recovery["delta_v_eci"],
-                ))
-                log.info(f"Recovery burn scheduled for {event.sat_id} at epoch {recovery['burn_epoch']:.0f}")
+        dv  = maneuver["dv_eci"]
+        rdv = recovery_dv_arr
 
-        log.info(f"Evasion burn scheduled for {event.sat_id} | ΔV={evasion['dv_magnitude']*1000:.2f} m/s")
+        evasion_cmd = BurnCommand(
+            burn_id=f"EVA-{event.satellite_id}-{uuid.uuid4().hex[:6].upper()}",
+            burnTime=evasion_time,
+            deltaV_vector=Vec3(x=float(dv[0]), y=float(dv[1]), z=float(dv[2])),
+        )
 
+        recovery_cmd = BurnCommand(
+            burn_id=f"REC-{event.satellite_id}-{uuid.uuid4().hex[:6].upper()}",
+            burnTime=recovery_time,
+            deltaV_vector=Vec3(x=float(rdv[0]), y=float(rdv[1]), z=float(rdv[2])),
+        )
 
-def _epoch_to_iso(epoch: float) -> str:
-    """Convert sim epoch offset to ISO string (approximate)."""
-    from datetime import datetime, timezone, timedelta
-    if state.sim_time:
-        base = datetime.fromisoformat(state.sim_time.replace("Z", "+00:00"))
-        result = base + timedelta(seconds=epoch - state.sim_epoch)
-        return result.isoformat()
-    return datetime.now(timezone.utc).isoformat()
+        state_store.add_maneuver(event.satellite_id, evasion_cmd)
+        state_store.add_maneuver(event.satellite_id, recovery_cmd)
+
+        logger.info(
+            f"[ACM] Burns scheduled for {event.satellite_id} | "
+            f"{evasion_cmd.burn_id} @ {evasion_time} | "
+            f"{recovery_cmd.burn_id} @ {recovery_time} | "
+            f"dir={maneuver['direction']} | "
+            f"dv={maneuver['dv_kms'] * 1000:.1f} m/s | "
+            f"fuel={maneuver['fuel_cost']:.4f} kg"
+        )
+        scheduled_count += 1
+
+    return scheduled_count
 
 
+def _iso_offset(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()

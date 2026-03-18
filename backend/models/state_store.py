@@ -90,25 +90,145 @@ class SimulationState:
             return None
         return max(b.burn_time_epoch for b in executed)
 
+    # ── Dict-style access (used by conjunction.py / telemetry.py) ────────────
+
+    @property
+    def satellites(self) -> dict[str, "SpaceObject"]:
+        """Return {id: SpaceObject} for all SAT objects."""
+        return {id: obj for id, obj in self.objects.items() if obj.type == "SAT"}
+
+    @property
+    def debris(self) -> dict[str, "SpaceObject"]:
+        """Return {id: SpaceObject} for all DEBRIS objects."""
+        return {id: obj for id, obj in self.objects.items() if obj.type == "DEBRIS"}
+
+    # ── Mutation helpers (used by telemetry.py) ───────────────────────────────
+
+    def update_satellite(
+        self,
+        satellite_id: str,
+        position: list,
+        velocity: list,
+        timestamp: Optional[str] = None,
+        fuel_kg: Optional[float] = None,
+    ) -> None:
+        """
+        Upsert a satellite SpaceObject from incoming telemetry.
+
+        If the satellite already exists its position, velocity, and optionally
+        fuel are updated in-place.  If it is new it is created with defaults.
+        """
+        if satellite_id in self.objects:
+            obj = self.objects[satellite_id]
+            obj.r = position
+            obj.v = velocity
+            if fuel_kg is not None:
+                obj.fuel_kg = fuel_kg
+        else:
+            self.objects[satellite_id] = SpaceObject(
+                id=satellite_id,
+                type="SAT",
+                r=position,
+                v=velocity,
+                fuel_kg=fuel_kg if fuel_kg is not None else INITIAL_FUEL_KG,
+            )
+        save_state()
+
+    def update_debris(
+        self,
+        debris_id: str,
+        position: list,
+        velocity: list,
+        timestamp: Optional[str] = None,
+    ) -> None:
+        """
+        Upsert a debris SpaceObject from incoming telemetry.
+        """
+        if debris_id in self.objects:
+            obj = self.objects[debris_id]
+            obj.r = position
+            obj.v = velocity
+        else:
+            self.objects[debris_id] = SpaceObject(
+                id=debris_id,
+                type="DEBRIS",
+                r=position,
+                v=velocity,
+                fuel_kg=0.0,   # debris carries no fuel
+            )
+        save_state()
+
+    def add_maneuver(self, satellite_id: str, burn_cmd) -> None:
+        """
+        Convert a BurnCommand (from schemas.py) into a ScheduledBurn and
+        append it to the burns queue.
+
+        Args:
+            satellite_id: Target satellite ID
+            burn_cmd:     BurnCommand instance (burn_id, burnTime, deltaV_vector)
+        """
+        dv = burn_cmd.deltaV_vector   # Vec3
+
+        scheduled = ScheduledBurn(
+            burn_id=burn_cmd.burn_id,
+            satellite_id=satellite_id,
+            burn_time_iso=burn_cmd.burnTime,
+            burn_time_epoch=self._iso_to_epoch(burn_cmd.burnTime),
+            delta_v_eci=[dv.x, dv.y, dv.z],
+        )
+        self.burns.append(scheduled)
+        # Keep burns sorted by scheduled time
+        self.burns.sort(key=lambda b: b.burn_time_epoch)
+
+    @staticmethod
+    def _iso_to_epoch(iso_str: str) -> float:
+        """Convert ISO 8601 string to seconds since J2000 epoch."""
+        from datetime import timezone
+        J2000 = datetime(2000, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        try:
+            # Handle both naive and aware ISO strings
+            if iso_str.endswith("Z"):
+                iso_str = iso_str[:-1] + "+00:00"
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return (dt - J2000).total_seconds()
+        except Exception:
+            return 0.0
+
 
 # Single global instance — import this everywhere
 state = SimulationState()
 
+# ── Compatibility alias ───────────────────────────────────────────────────────
+# telemetry.py and other ACM modules import `state_store` by name.
+# This alias keeps the original `state` name working too.
+state_store = state
+
 
 import json, os
 
-SAVE_FILE = "sim_state.json"
+# Always save next to this file — never relative to cwd
+SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_state.json")
+
 
 def save_state():
+    # Never overwrite a populated save file with empty objects —
+    # this prevents a stale restart from wiping real data.
+    if not state.objects and os.path.exists(SAVE_FILE):
+        return
+
     data = {
-        "sim_time": state.sim_time,
+        "sim_time":  state.sim_time,
         "sim_epoch": state.sim_epoch,
         "objects": {
             id: {
-                "id": obj.id, "type": obj.type,
-                "r": obj.r, "v": obj.v,
-                "fuel_kg": obj.fuel_kg,
-                "status": obj.status,
+                "id":        obj.id,
+                "type":      obj.type,
+                "r":         obj.r,
+                "v":         obj.v,
+                "fuel_kg":   obj.fuel_kg,
+                "status":    obj.status,
                 "nominal_r": obj.nominal_r,
                 "nominal_v": obj.nominal_v,
             }
@@ -116,16 +236,29 @@ def save_state():
         }
     }
     with open(SAVE_FILE, "w") as f:
-        json.dump(data, f)
+        json.dump(data, f, indent=2)
+
 
 def load_state():
     if not os.path.exists(SAVE_FILE):
         return
-    with open(SAVE_FILE) as f:
-        data = json.load(f)
+    try:
+        with open(SAVE_FILE) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return   # corrupt or empty file — start fresh
+
+    loaded_objects = data.get("objects", {})
+
+    # Only restore if saved file actually has objects.
+    # Prevents a stale empty json from wiping live in-memory state.
+    if not loaded_objects:
+        return
+
     state.sim_time  = data.get("sim_time")
     state.sim_epoch = data.get("sim_epoch", 0.0)
-    for id, obj in data.get("objects", {}).items():
+
+    for id, obj in loaded_objects.items():
         state.objects[id] = SpaceObject(
             id        = obj["id"],
             type      = obj["type"],
@@ -136,6 +269,13 @@ def load_state():
             nominal_r = obj.get("nominal_r"),
             nominal_v = obj.get("nominal_v"),
         )
+
+
+def clear_save_file():
+    """Delete the save file — useful for a clean restart during testing."""
+    if os.path.exists(SAVE_FILE):
+        os.remove(SAVE_FILE)
+
 
 # Auto-load on import
 load_state()
