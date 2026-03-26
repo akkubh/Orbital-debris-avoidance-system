@@ -6,10 +6,39 @@ import random
 import math
 import urllib.request
 import json
+import numpy as np
 
 API = "http://localhost:8000"
 random.seed(42)
+INJECT_COLLISION_PROB = 0.25
+def inject_conjunction(objects):
+    sats = [o for o in objects.values() if o["type"] == "SAT"]
 
+    if not sats:
+        return
+
+    sat = random.choice(sats)
+
+    r_sat = np.array(sat["r"])
+    v_sat = np.array(sat["v"])
+
+    # collision expected in ~30 minutes
+    t = 1800
+
+    future_pos = r_sat + v_sat * t
+
+    debris_id = f"DEB-COLL-{random.randint(1000,9999)}"
+
+    objects[debris_id] = {
+        "id": debris_id,
+        "type": "DEBRIS",
+        "r": (future_pos + np.random.normal(0, 0.05, 3)).tolist(),  # ~50m offset
+        "v": (v_sat + np.random.normal(0, 0.001, 3)).tolist(),
+        "fuel_kg": 0.0,
+        "status": "NOMINAL",
+        "nominal_r": None,
+        "nominal_v": None
+    }
 def random_leo_object(id, type):
     # Random LEO orbit: altitude 400-800km, so r_norm = 6778-7178 km
     r_norm = random.uniform(6778, 7178)

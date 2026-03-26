@@ -1,21 +1,13 @@
 """
 api/telemetry.py
-━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━
 Telemetry Ingestion & Auto-Evasion for ACM (Autonomous Constellation Manager)
 National Space Hackathon 2026
 
-Uses exact schema names from models/schemas.py:
-    TelemetryRequest  — batch multi-object telemetry payload
-    TelemetryResponse — ACK response
-    BurnCommand       — individual burn instruction
-    Vec3              — 3D vector (x, y, z)
-
-CHANGES vs original:
-  • _auto_schedule_evasions() gates on risk_level:
-      LOW     → skip entirely (no burn)
-      MEDIUM  → log warning only
-      HIGH    → schedule evasion + recovery
-      CRITICAL→ run optimize_delta_v() first, then schedule
+FIX 6: _auto_schedule_evasions() now checks whether the satellite will lose
+        LOS before TCA. If so, it calls next_los_window() to determine when
+        LOS returns and schedules the maneuver before the upcoming blackout
+        begins, while still respecting the SIGNAL_LATENCY rule.
 """
 
 import uuid
@@ -24,16 +16,16 @@ import numpy as np
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException
 
-# ── Schema imports — exact names from models/schemas.py ──────────────────────
 from models.schemas import (
     TelemetryRequest,
     TelemetryResponse,
     BurnCommand,
     Vec3,
 )
-from models.state_store import state_store
+from models.state_store import state_store, SIGNAL_LATENCY
 from physics.conjunction import screen_conjunctions
 from physics.maneuver_calc import plan_evasion_burn, plan_recovery_burn, optimize_delta_v
+from physics.ground_station import has_line_of_sight, next_los_window
 
 logger = logging.getLogger("ACM.Telemetry")
 
@@ -46,16 +38,7 @@ AUTO_EVASION_RISK_LEVELS = {"HIGH", "CRITICAL"}
 
 @router.post("/api/telemetry", response_model=TelemetryResponse)
 async def ingest_telemetry(payload: TelemetryRequest):
-    """
-    Ingest a batch of satellite + debris telemetry objects.
-
-    Each TelemetryObject has:
-        id   : str          — object identifier
-        type : "SAT"|"DEBRIS"
-        r    : Vec3         — position (km, ECI)
-        v    : Vec3         — velocity (km/s, ECI)
-    """
-    timestamp = payload.timestamp
+    timestamp        = payload.timestamp
     sat_ids_ingested = []
 
     for obj in payload.objects:
@@ -81,7 +64,6 @@ async def ingest_telemetry(payload: TelemetryRequest):
             )
             logger.debug(f"[ACM] Telemetry ingested: DEBRIS {obj.id}")
 
-    # Screen conjunctions once per batch
     conjunction_events = screen_conjunctions(
         satellites=state_store.satellites,
         debris_objects=state_store.debris,
@@ -104,10 +86,10 @@ def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) ->
     """
     Schedule evasion burns only for HIGH / CRITICAL risk events.
 
-    LOW    → skip
-    MEDIUM → log only
-    HIGH   → schedule evasion + recovery
-    CRITICAL → optimize ΔV first, then schedule
+    FIX 6: Before scheduling, check if the satellite will lose LOS before TCA.
+           If a blackout is coming, call next_los_window() and schedule the
+           maneuver before the blackout window begins (still respecting
+           SIGNAL_LATENCY).
     """
     scheduled_count = 0
 
@@ -177,9 +159,16 @@ def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) ->
             logger.error(f"[ACM] Evasion planning failed for {event.satellite_id}")
             continue
 
-        recovery_dv_arr = plan_recovery_burn(maneuver["dv_eci"])
+        recovery_dv_arr = plan_recovery_burn(maneuver["dv_eci"], sat=sat_state)
 
-        evasion_time  = _iso_offset(event.tca_seconds * 0.5)
+        # ── FIX 6: Blackout-aware burn timing ────────────────────────────────
+        # Default evasion time: halfway to TCA
+        default_evasion_offset = event.tca_seconds * 0.5
+        evasion_offset_s       = _resolve_evasion_time(
+            sat_state, event.tca_seconds, default_evasion_offset
+        )
+
+        evasion_time  = _iso_offset(evasion_offset_s)
         recovery_time = _iso_offset(event.tca_seconds * 1.5)
 
         dv  = maneuver["dv_eci"]
@@ -211,6 +200,90 @@ def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) ->
         scheduled_count += 1
 
     return scheduled_count
+
+
+# ── FIX 6 Helper: Blackout-Aware Evasion Timing ───────────────────────────────
+
+def _resolve_evasion_time(sat_state, tca_seconds: float, default_offset_s: float) -> float:
+    """
+    Determine when to upload/execute the evasion burn, accounting for
+    potential ground-station blackouts between now and TCA.
+
+    Logic (FIX 6):
+      1. Check current LOS.
+      2. If currently has LOS → check whether LOS is maintained until TCA.
+         - Walk forward in small steps; if LOS drops before TCA, use the
+           time just before blackout (minus SIGNAL_LATENCY buffer) as the
+           upload deadline, and schedule the burn at that deadline.
+      3. If currently in blackout → call next_los_window() to find when LOS
+         returns, then schedule the burn immediately after that window opens
+         (+ SIGNAL_LATENCY).
+      4. In all cases ensure offset >= SIGNAL_LATENCY.
+
+    Returns:
+        Offset in seconds from now for the evasion burn.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    current_los, _ = has_line_of_sight(sat_state.r, now_iso)
+
+    # ── Case A: Currently in blackout — find next LOS window ─────────────────
+    if not current_los:
+        window = next_los_window(
+            sat_r=sat_state.r,
+            sat_v=sat_state.v,
+            sim_time_iso=now_iso,
+            search_window_s=min(tca_seconds, 7200.0),
+        )
+        if window["found"]:
+            # Upload as soon as LOS returns, respecting SIGNAL_LATENCY
+            upload_offset = window["offset_s"] + SIGNAL_LATENCY
+            logger.info(
+                f"[ACM] Satellite currently in blackout. "
+                f"LOS returns in {window['offset_s']:.0f}s — "
+                f"evasion burn offset set to {upload_offset:.0f}s"
+            )
+            return max(upload_offset, SIGNAL_LATENCY)
+        else:
+            # No LOS found before TCA — use default and warn
+            logger.warning(
+                f"[ACM] No LOS window found before TCA={tca_seconds:.0f}s — "
+                f"using default offset={default_offset_s:.0f}s"
+            )
+            return max(default_offset_s, SIGNAL_LATENCY)
+
+    # ── Case B: Currently has LOS — check if blackout occurs before TCA ───────
+    # Probe LOS in steps up to TCA to find the first blackout instant
+    from physics.propagator import rk4_step as _rk4
+    import numpy as _np
+
+    probe_state = _np.array(sat_state.r + sat_state.v, dtype=float)
+    probe_dt    = 30.0    # seconds per probe step
+    elapsed     = 0.0
+    blackout_at = None    # offset (seconds from now) when LOS first drops
+
+    while elapsed < tca_seconds:
+        step         = min(probe_dt, tca_seconds - elapsed)
+        probe_state  = _rk4(probe_state, step)
+        elapsed     += step
+
+        future_iso   = _iso_offset(elapsed)
+        future_los, _ = has_line_of_sight(probe_state[:3].tolist(), future_iso)
+
+        if not future_los:
+            blackout_at = elapsed
+            break
+
+    if blackout_at is not None:
+        # Schedule burn just before blackout starts, with SIGNAL_LATENCY margin
+        safe_offset = max(blackout_at - SIGNAL_LATENCY, SIGNAL_LATENCY)
+        logger.info(
+            f"[ACM] LOS will drop at T+{blackout_at:.0f}s (before TCA={tca_seconds:.0f}s). "
+            f"Scheduling evasion burn at T+{safe_offset:.0f}s to beat blackout."
+        )
+        return safe_offset
+
+    # No blackout before TCA — use the default half-TCA offset
+    return max(default_offset_s, SIGNAL_LATENCY)
 
 
 def _iso_offset(seconds: float) -> str:
