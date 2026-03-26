@@ -20,3 +20,14 @@ export const fetchSnapshot = async () => {
     };
   }
 };
+
+export const loadCelestrakData = async (maxDebris = 500, maxSats = 50) => {
+  try {
+    const res = await axios.post(
+      `/api/data/load-celestrak?max_debris=${maxDebris}&max_sats=${maxSats}`
+    );
+    return res.data;
+  } catch (err) {
+    console.error("CelesTrak load error", err);
+  }
+};

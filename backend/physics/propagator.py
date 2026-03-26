@@ -2,6 +2,10 @@
 RK4 orbital propagator with J2 perturbation.
 All units: km, km/s, seconds.
 """
+
+from sgp4.api import Satrec, jday
+from datetime import datetime, timezone
+
 import numpy as np
 
 # ── Constants ─────────────────────────────────────────────────────────
@@ -134,3 +138,20 @@ def compute_gmst(sim_time_iso: str) -> float:
     gmst_deg = (280.46061837 + 360.98564736629 * (jd - 2451545.0)
                 + 0.000387933 * T ** 2) % 360.0
     return math.radians(gmst_deg)
+
+
+from sgp4.api import Satrec, jday
+from datetime import datetime, timezone
+
+def tle_to_state_vector(line1, line2):
+    sat = Satrec.twoline2rv(line1, line2)
+    now = datetime.now(timezone.utc)
+    jd, fr = jday(now.year, now.month, now.day,
+                  now.hour, now.minute, now.second)
+    e, r, v = sat.sgp4(jd, fr)
+    if e != 0:
+        return None
+    return {
+        "position": list(r),  # ECI km
+        "velocity": list(v)   # ECI km/s
+    }

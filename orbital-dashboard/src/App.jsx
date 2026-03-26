@@ -11,6 +11,22 @@ import ManeuverPath from "./components/ManeuverPath";
 import { fetchSnapshot } from "./services/api";
 import useStore from "./store/useStore";
 
+import { loadCelestrakData } from "./services/api";
+
+// inside your component:
+<button
+  onClick={() => loadCelestrakData(500, 50)}
+  style={{
+    position: "absolute", bottom: 20, left: 20,
+    background: "#00ff88", color: "#000",
+    border: "none", padding: "10px 20px",
+    cursor: "pointer", fontWeight: "bold",
+    borderRadius: "4px"
+  }}
+>
+  LOAD REAL TLE DATA
+</button>
+
 export default function App() {
   const { satellites, debris, alerts, paths,
           setData, generateAlerts, generatePaths } = useStore();

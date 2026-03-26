@@ -31,14 +31,15 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────
-from api.telemetry import router as telemetry_router
-from api.maneuver  import router as maneuver_router
-from api.simulate  import router as simulate_router
+from api.telemetry  import router as telemetry_router
+from api.maneuver   import router as maneuver_router
+from api.simulate   import router as simulate_router
+from api.celestrak  import router as celestrak_router
 
 app.include_router(telemetry_router)
 app.include_router(maneuver_router)
 app.include_router(simulate_router)
-
+app.include_router(celestrak_router)
 
 # ── Health check ──────────────────────────────────────────────────────
 @app.get("/")
@@ -53,12 +54,9 @@ def health():
         "cdm_warnings"  : state.active_cdm_count(),
     }
 
-
-
 # ── Debug: raw state dump ─────────────────────────────────────────────
 @app.get("/api/state")
 def raw_state():
-    """Shows everything currently in memory — useful for debugging."""
     from models.state_store import state
     return {
         "sim_time":   state.sim_time,

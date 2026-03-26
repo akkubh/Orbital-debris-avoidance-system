@@ -1,0 +1,39 @@
+from fastapi import APIRouter
+from data.tle_fetcher import fetch_debris_tles, fetch_satellite_tles
+from physics.propagator import tle_to_state_vector
+from models.state_store import state
+
+router = APIRouter()
+
+@router.post("/api/data/load-celestrak")
+async def load_celestrak_data(max_debris: int = 500, max_sats: int = 50):
+    debris_tles = fetch_debris_tles()[:max_debris]
+    sat_tles = fetch_satellite_tles()[:max_sats]
+
+    sat_count = 0
+    for s in sat_tles:
+        sv = tle_to_state_vector(s["line1"], s["line2"])
+        if sv:
+            state.update_satellite(
+                satellite_id=s["name"],
+                position=sv["position"],
+                velocity=sv["velocity"]
+            )
+            sat_count += 1
+
+    deb_count = 0
+    for d in debris_tles:
+        sv = tle_to_state_vector(d["line1"], d["line2"])
+        if sv:
+            state.update_debris(
+                debris_id=d["name"],
+                position=sv["position"],
+                velocity=sv["velocity"]
+            )
+            deb_count += 1
+
+    return {
+        "status": "loaded",
+        "satellites": sat_count,
+        "debris": deb_count
+    }
