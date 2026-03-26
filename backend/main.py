@@ -77,3 +77,14 @@ if __name__ == "__main__":
     import uvicorn
     log.info("Starting ACM server on 0.0.0.0:8000")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    
+    from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allows your React app to connect
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
