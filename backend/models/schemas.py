@@ -1,12 +1,9 @@
 """
-Pydantic schemas — exact match to the hackathon API specification.
+Pydantic schemas — hackathon API specification.
 """
 from pydantic import BaseModel, field_validator
 from typing import Optional
-from datetime import datetime
 
-
-# ── Telemetry ─────────────────────────────────────────────────────────
 
 class Vec3(BaseModel):
     x: float
@@ -19,7 +16,7 @@ class Vec3(BaseModel):
 
 class TelemetryObject(BaseModel):
     id: str
-    type: str          # "SAT" or "DEBRIS"
+    type: str
     r: Vec3
     v: Vec3
 
@@ -42,12 +39,10 @@ class TelemetryResponse(BaseModel):
     active_cdm_warnings: int
 
 
-# ── Maneuver scheduling ───────────────────────────────────────────────
-
 class BurnCommand(BaseModel):
     burn_id: str
-    burnTime: str              # ISO 8601
-    deltaV_vector: Vec3        # in ECI km/s
+    burnTime: str
+    deltaV_vector: Vec3
 
 
 class ManeuverRequest(BaseModel):
@@ -65,8 +60,6 @@ class ManeuverResponse(BaseModel):
     status: str
     validation: ManeuverValidation
 
-
-# ── Simulation tick ───────────────────────────────────────────────────
 
 class SimStepRequest(BaseModel):
     step_seconds: float
@@ -86,17 +79,26 @@ class SimStepResponse(BaseModel):
     maneuvers_executed: int
 
 
-# ── Visualization snapshot ────────────────────────────────────────────
-
 class SatelliteSnapshot(BaseModel):
     id: str
-    lat: float
-    lon: float
+    x: float
+    y: float
+    z: float
     fuel_kg: float
     status: str
+    # pending_burns lets the frontend colour a satellite YELLOW as soon as
+    # a burn is queued, without waiting for the status field to update
+    pending_burns: int = 0
+
+
+class DebrisSnapshot(BaseModel):
+    id: str
+    x: float
+    y: float
+    z: float
 
 
 class VisualizationSnapshot(BaseModel):
-    timestamp: str
+    timestamp:  str
     satellites: list[SatelliteSnapshot]
-    debris_cloud: list   # list of [id, lat, lon, alt] tuples
+    debris:     list[DebrisSnapshot]

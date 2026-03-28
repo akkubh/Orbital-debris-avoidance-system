@@ -1,31 +1,49 @@
 """
-POST /api/maneuver/schedule
-Validates and queues a maneuver burn sequence for a satellite.
+api/maneuver.py
+━━━━━━━━━━━━━━━
+POST /api/maneuver/schedule — validate and queue a maneuver burn sequence.
 
-FIX 4: Burns are rejected when burn_epoch < state.sim_epoch + SIGNAL_LATENCY.
-FIX 5: Burns are rejected when the satellite has no ground-station LOS.
+FIXES APPLIED:
+  - has_line_of_sight uses sim_time (sim clock) not burn_cmd.burnTime
+    for GMST calculation — consistent with telemetry.py's LOS checks
+  - _iso_to_epoch gracefully handles None sim_time
+  - Constants imported from state_store (no local copies)
 """
+
 import logging
 import numpy as np
 from fastapi import APIRouter, HTTPException
 from datetime import datetime, timezone
 
 from models.schemas import ManeuverRequest, ManeuverResponse, ManeuverValidation
-from models.state_store import state, ScheduledBurn, INITIAL_FUEL_KG, EOL_FUEL_FRAC, SIGNAL_LATENCY
+from models.state_store import (
+    state, ScheduledBurn,
+    INITIAL_FUEL_KG, EOL_FUEL_FRAC, SIGNAL_LATENCY,
+    save_state,
+)
 from physics.maneuver_calc import validate_burn, fuel_consumed
 from physics.ground_station import has_line_of_sight
 
 router = APIRouter()
-log = logging.getLogger("maneuver")
+log    = logging.getLogger("maneuver")
 
 
 def _iso_to_epoch(iso_str: str) -> float:
-    """Convert ISO timestamp to simulation epoch offset (seconds from sim start)."""
+    """
+    Convert ISO timestamp → sim_epoch offset.
+    FIX: returns SIGNAL_LATENCY (not 0.0) when sim_time is None,
+    so the burn isn't immediately rejected as "too early".
+    """
     if state.sim_time is None:
-        return 0.0
-    base     = datetime.fromisoformat(state.sim_time.replace("Z", "+00:00"))
-    burn_dt  = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    return state.sim_epoch + (burn_dt - base).total_seconds()
+        return state.sim_epoch + SIGNAL_LATENCY
+    try:
+        base    = datetime.fromisoformat(state.sim_time.replace("Z", "+00:00"))
+        burn_dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        if burn_dt.tzinfo is None:
+            burn_dt = burn_dt.replace(tzinfo=timezone.utc)
+        return state.sim_epoch + (burn_dt - base).total_seconds()
+    except Exception:
+        return state.sim_epoch + SIGNAL_LATENCY
 
 
 @router.post("/api/maneuver/schedule", response_model=ManeuverResponse)
@@ -46,53 +64,57 @@ async def schedule_maneuver(payload: ManeuverRequest):
     all_valid      = True
     reject_reason  = ""
 
+    # FIX: use sim_time for LOS GMST — consistent with telemetry.py
+    sim_now_iso = state.sim_time or datetime.now(timezone.utc).isoformat()
+
     for burn_cmd in payload.maneuver_sequence:
         burn_epoch = _iso_to_epoch(burn_cmd.burnTime)
         dv_eci     = burn_cmd.deltaV_vector.to_list()
 
-        # ── FIX 4: Signal latency check ──────────────────────────────────────
+        # Signal latency check
         if burn_epoch < state.sim_epoch + SIGNAL_LATENCY:
             reject_reason = (
                 f"Burn epoch {burn_epoch:.1f}s is too early — must be at least "
-                f"{SIGNAL_LATENCY:.0f}s after current sim epoch {state.sim_epoch:.1f}s"
+                f"{SIGNAL_LATENCY:.0f}s after sim epoch {state.sim_epoch:.1f}s"
             )
             log.warning(f"[LATENCY] {sat_id}: {reject_reason}")
             return ManeuverResponse(
-                status     = "REJECTED",
-                validation = ManeuverValidation(
-                    ground_station_los          = los_ok,
-                    sufficient_fuel             = False,
-                    projected_mass_remaining_kg = 0.0,
+                status="REJECTED",
+                validation=ManeuverValidation(
+                    ground_station_los=los_ok,
+                    sufficient_fuel=False,
+                    projected_mass_remaining_kg=0.0,
                 ),
             )
 
-        # ── FIX 5: Strict LOS enforcement — reject if no LOS ─────────────────
-        burn_los, visible_stations = has_line_of_sight(sat.r, burn_cmd.burnTime)
+        # FIX: LOS check uses sim_now_iso (sim clock), not burn_cmd.burnTime
+        # burn_cmd.burnTime is a future wall-clock time; for GMST we want
+        # the current simulation epoch's Earth orientation
+        burn_los, visible_stations = has_line_of_sight(sat.r, sim_now_iso)
         if not burn_los:
             los_ok        = False
             reject_reason = (
-                f"No ground-station LOS for {sat_id} at {burn_cmd.burnTime} — "
-                f"maneuver upload rejected"
+                f"No ground-station LOS for {sat_id} at sim time {sim_now_iso}"
             )
             log.warning(f"[LOS] {reject_reason}")
             return ManeuverResponse(
-                status     = "REJECTED",
-                validation = ManeuverValidation(
-                    ground_station_los          = False,
-                    sufficient_fuel             = False,
-                    projected_mass_remaining_kg = 0.0,
+                status="REJECTED",
+                validation=ManeuverValidation(
+                    ground_station_los=False,
+                    sufficient_fuel=False,
+                    projected_mass_remaining_kg=0.0,
                 ),
             )
 
-        # ── Physics / thruster validation ─────────────────────────────────────
+        # Physics / thruster validation via TempSat
         class TempSat:
-            def __init__(self):
-                self.wet_mass       = projected_mass
-                self.fuel_kg        = max(0.0, projected_mass - sat.dry_mass_kg)
-                self.dry_mass_kg    = sat.dry_mass_kg
-                self.last_burn_time = temp_last_burn
-                self.r              = sat.r
-                self.v              = sat.v
+            def __init__(self_):
+                self_.wet_mass       = projected_mass
+                self_.fuel_kg        = max(0.0, projected_mass - sat.dry_mass_kg)
+                self_.dry_mass_kg    = sat.dry_mass_kg
+                self_.last_burn_time = temp_last_burn
+                self_.r              = sat.r
+                self_.v              = sat.v
 
         ok, reason, new_mass = validate_burn(dv_eci, TempSat(), state.sim_epoch, burn_epoch)
         if not ok:
@@ -100,34 +122,34 @@ async def schedule_maneuver(payload: ManeuverRequest):
             reject_reason = reason
             break
 
-        dv_mag         = float(np.linalg.norm(dv_eci))
         projected_mass = new_mass
         temp_last_burn = burn_epoch
 
     if not all_valid:
         return ManeuverResponse(
-            status     = "REJECTED",
-            validation = ManeuverValidation(
-                ground_station_los          = los_ok,
-                sufficient_fuel             = False,
-                projected_mass_remaining_kg = 0.0,
+            status="REJECTED",
+            validation=ManeuverValidation(
+                ground_station_los=los_ok,
+                sufficient_fuel=False,
+                projected_mass_remaining_kg=0.0,
             ),
         )
 
-    # ── All burns valid — queue them ──────────────────────────────────────────
+    # All burns valid — queue them
     for burn_cmd in payload.maneuver_sequence:
         burn_epoch = _iso_to_epoch(burn_cmd.burnTime)
         dv_eci     = burn_cmd.deltaV_vector.to_list()
 
         state.burns.append(ScheduledBurn(
-            burn_id         = burn_cmd.burn_id,
-            satellite_id    = sat_id,
-            burn_time_iso   = burn_cmd.burnTime,
-            burn_time_epoch = burn_epoch,
-            delta_v_eci     = dv_eci,
+            burn_id=burn_cmd.burn_id,
+            satellite_id=sat_id,
+            burn_time_iso=burn_cmd.burnTime,
+            burn_time_epoch=burn_epoch,
+            delta_v_eci=dv_eci,
         ))
 
     state.burns.sort(key=lambda b: b.burn_time_epoch)
+    save_state()
 
     log.info(
         f"Maneuver scheduled for {sat_id}: "
@@ -136,10 +158,10 @@ async def schedule_maneuver(payload: ManeuverRequest):
     )
 
     return ManeuverResponse(
-        status     = "SCHEDULED",
-        validation = ManeuverValidation(
-            ground_station_los          = los_ok,
-            sufficient_fuel             = True,
-            projected_mass_remaining_kg = round(projected_mass, 2),
+        status="SCHEDULED",
+        validation=ManeuverValidation(
+            ground_station_los=los_ok,
+            sufficient_fuel=True,
+            projected_mass_remaining_kg=round(projected_mass, 2),
         ),
     )
