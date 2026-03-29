@@ -2,12 +2,6 @@
 api/maneuver.py
 ━━━━━━━━━━━━━━━
 POST /api/maneuver/schedule — validate and queue a maneuver burn sequence.
-
-FIXES APPLIED:
-  - has_line_of_sight uses sim_time (sim clock) not burn_cmd.burnTime
-    for GMST calculation — consistent with telemetry.py's LOS checks
-  - _iso_to_epoch gracefully handles None sim_time
-  - Constants imported from state_store (no local copies)
 """
 
 import logging
@@ -21,7 +15,7 @@ from models.state_store import (
     INITIAL_FUEL_KG, EOL_FUEL_FRAC, SIGNAL_LATENCY,
     save_state,
 )
-from physics.maneuver_calc import validate_burn, fuel_consumed
+from physics.maneuver_calc import validate_burn
 from physics.ground_station import has_line_of_sight
 
 router = APIRouter()
@@ -31,19 +25,37 @@ log    = logging.getLogger("maneuver")
 def _iso_to_epoch(iso_str: str) -> float:
     """
     Convert ISO timestamp → sim_epoch offset.
-    FIX: returns SIGNAL_LATENCY (not 0.0) when sim_time is None,
-    so the burn isn't immediately rejected as "too early".
+    Returns SIGNAL_LATENCY offset when sim_time is None so the burn
+    isn't immediately rejected as "too early".
     """
     if state.sim_time is None:
         return state.sim_epoch + SIGNAL_LATENCY
     try:
         base    = datetime.fromisoformat(state.sim_time.replace("Z", "+00:00"))
+        # FIX: ensure base is timezone-aware so subtraction with aware burn_dt
+        # doesn't raise TypeError on Python <3.11 where fromisoformat may
+        # return a naive datetime even with +00:00 in some edge cases.
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
         burn_dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
         if burn_dt.tzinfo is None:
             burn_dt = burn_dt.replace(tzinfo=timezone.utc)
         return state.sim_epoch + (burn_dt - base).total_seconds()
     except Exception:
         return state.sim_epoch + SIGNAL_LATENCY
+
+
+# FIX: TempSat defined once at module level outside any loop.
+# Previously defined inside the for-burn loop — redefined every iteration.
+class _TempSat:
+    """Lightweight proxy used by validate_burn for sequential burn planning."""
+    def __init__(self, wet_mass, fuel_kg, dry_mass_kg, last_burn_time, r, v):
+        self.wet_mass       = wet_mass
+        self.fuel_kg        = fuel_kg
+        self.dry_mass_kg    = dry_mass_kg
+        self.last_burn_time = last_burn_time
+        self.r              = r
+        self.v              = v
 
 
 @router.post("/api/maneuver/schedule", response_model=ManeuverResponse)
@@ -57,6 +69,11 @@ async def schedule_maneuver(payload: ManeuverRequest):
         raise HTTPException(status_code=400, detail=f"{sat_id} is not a satellite")
     if sat.status == "DEAD":
         raise HTTPException(status_code=409, detail=f"{sat_id} is DEAD — no maneuvers possible")
+    # FIX: also block EOL satellites — they have a graveyard burn pending and
+    # near-zero fuel. Manual burns would interfere with deorbit sequence or
+    # fail fuel validation, leaving the sequence in a broken state.
+    if sat.status == "EOL":
+        raise HTTPException(status_code=409, detail=f"{sat_id} is EOL — no manual maneuvers possible")
 
     projected_mass = sat.wet_mass
     temp_last_burn = sat.last_burn_time
@@ -64,7 +81,6 @@ async def schedule_maneuver(payload: ManeuverRequest):
     all_valid      = True
     reject_reason  = ""
 
-    # FIX: use sim_time for LOS GMST — consistent with telemetry.py
     sim_now_iso = state.sim_time or datetime.now(timezone.utc).isoformat()
 
     for burn_cmd in payload.maneuver_sequence:
@@ -87,9 +103,7 @@ async def schedule_maneuver(payload: ManeuverRequest):
                 ),
             )
 
-        # FIX: LOS check uses sim_now_iso (sim clock), not burn_cmd.burnTime
-        # burn_cmd.burnTime is a future wall-clock time; for GMST we want
-        # the current simulation epoch's Earth orientation
+        # LOS check uses sim_now_iso (sim clock) for consistent GMST
         burn_los, visible_stations = has_line_of_sight(sat.r, sim_now_iso)
         if not burn_los:
             los_ok        = False
@@ -106,17 +120,16 @@ async def schedule_maneuver(payload: ManeuverRequest):
                 ),
             )
 
-        # Physics / thruster validation via TempSat
-        class TempSat:
-            def __init__(self_):
-                self_.wet_mass       = projected_mass
-                self_.fuel_kg        = max(0.0, projected_mass - sat.dry_mass_kg)
-                self_.dry_mass_kg    = sat.dry_mass_kg
-                self_.last_burn_time = temp_last_burn
-                self_.r              = sat.r
-                self_.v              = sat.v
-
-        ok, reason, new_mass = validate_burn(dv_eci, TempSat(), state.sim_epoch, burn_epoch)
+        # Physics / thruster validation
+        temp_sat = _TempSat(
+            wet_mass       = projected_mass,
+            fuel_kg        = max(0.0, projected_mass - sat.dry_mass_kg),
+            dry_mass_kg    = sat.dry_mass_kg,
+            last_burn_time = temp_last_burn,
+            r              = sat.r,
+            v              = sat.v,
+        )
+        ok, reason, new_mass = validate_burn(dv_eci, temp_sat, state.sim_epoch, burn_epoch)
         if not ok:
             all_valid     = False
             reject_reason = reason

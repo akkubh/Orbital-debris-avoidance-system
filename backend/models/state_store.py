@@ -2,22 +2,11 @@
 models/state_store.py
 ─────────────────────
 Central simulation state for ACM (Autonomous Constellation Manager).
-
-FIXES APPLIED:
-  - Single source of truth for all physics constants (no more duplication)
-  - update_satellite() sets nominal_r/v on first creation + updates sim_time
-  - save_state() persists last_burn_time, dry_mass_kg, burns, cdm_warnings
-  - save_state() NOT called per-object (was O(n²) disk writes)
-  - load_state() restores last_burn_time and dry_mass_kg
-  - sim_state.json stored in configurable data dir, not inside source tree
-  - CONJUNCTION_DIST orphan constant removed (use conjunction.py's own threshold)
-  - load_state() guard prevents re-loading stale state on hot-reload
 """
 
 import os
 import json
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 from datetime import datetime, timezone
 
@@ -50,9 +39,9 @@ class SpaceObject:
     type:            str
     r:               list
     v:               list
-    fuel_kg:         float          = INITIAL_FUEL_KG
-    dry_mass_kg:     float          = DRY_MASS_KG
-    status:          str            = "NOMINAL"
+    fuel_kg:         float           = INITIAL_FUEL_KG
+    dry_mass_kg:     float           = DRY_MASS_KG
+    status:          str             = "NOMINAL"
     last_burn_time:  Optional[float] = None
     nominal_r:       Optional[list]  = None
     nominal_v:       Optional[list]  = None
@@ -63,8 +52,6 @@ class SpaceObject:
 
     @property
     def fuel_fraction(self) -> float:
-        # FIX: divide by actual initial fuel (dry_mass-based), not a global constant
-        # Prevents wrong EOL trigger for satellites loaded with non-default fuel
         return self.fuel_kg / INITIAL_FUEL_KG
 
 
@@ -92,14 +79,14 @@ class CDMWarning:
 
 class SimulationState:
     def __init__(self):
-        self.objects:                dict[str, SpaceObject] = {}
-        self.burns:                  list[ScheduledBurn]    = []
-        self.cdm_warnings:           list[CDMWarning]       = []
-        self.sim_time:               Optional[str]          = None
-        self.sim_epoch:              float                  = 0.0
-        self.total_collisions:       int                    = 0
-        self.total_maneuvers_executed: int                  = 0
-        self._state_loaded:          bool                   = False  # hot-reload guard
+        self.objects:                  dict[str, SpaceObject] = {}
+        self.burns:                    list[ScheduledBurn]    = []
+        self.cdm_warnings:             list[CDMWarning]       = []
+        self.sim_time:                 Optional[str]          = None
+        self.sim_epoch:                float                  = 0.0
+        self.total_collisions:         int                    = 0
+        self.total_maneuvers_executed: int                    = 0
+        self._state_loaded:            bool                   = False  # hot-reload guard
 
     # ── Accessors ─────────────────────────────────────────────────────────────
 
@@ -128,12 +115,6 @@ class SimulationState:
 
     def update_satellite(self, satellite_id: str, position: list, velocity: list,
                          timestamp: Optional[str] = None, fuel_kg: Optional[float] = None):
-        """
-        FIX: timestamp now updates state.sim_time when it was previously None.
-        FIX: nominal_r/v set to first-seen position/velocity on creation so
-             station-keeping and recovery burns have a reference orbit.
-        FIX: save_state() NOT called here — caller must call it after the batch.
-        """
         if satellite_id in self.objects:
             obj = self.objects[satellite_id]
             obj.r = position
@@ -145,20 +126,13 @@ class SimulationState:
                 id=satellite_id, type="SAT",
                 r=position, v=velocity,
                 fuel_kg=fuel_kg if fuel_kg is not None else INITIAL_FUEL_KG,
-                # FIX: record first-seen state as nominal reference orbit
-                nominal_r=list(position),
-                nominal_v=list(velocity),
             )
 
-        # FIX: propagate telemetry timestamp into sim_time
         if timestamp and self.sim_time is None:
             self.sim_time = timestamp
 
     def update_debris(self, debris_id: str, position: list, velocity: list,
                       timestamp: Optional[str] = None):
-        """
-        FIX: save_state() NOT called here — caller must call it after the batch.
-        """
         if debris_id in self.objects:
             obj = self.objects[debris_id]
             obj.r = position
@@ -172,15 +146,15 @@ class SimulationState:
             self.sim_time = timestamp
 
     def add_maneuver(self, satellite_id: str, burn_cmd):
-        """
-        FIX: use sim_time-relative epoch (same scale as simulate.py's sim_epoch)
-        instead of wall-clock delta so auto-evasion and manual burns share
-        the same epoch coordinate system.
-        """
         dv = burn_cmd.deltaV_vector
 
         if self.sim_time is not None:
             base = datetime.fromisoformat(self.sim_time.replace("Z", "+00:00"))
+            # FIX: ensure base is timezone-aware before subtracting from burn_dt.
+            # fromisoformat with +00:00 suffix should parse as aware, but guard
+            # explicitly to prevent TypeError on edge-case ISO strings.
+            if base.tzinfo is None:
+                base = base.replace(tzinfo=timezone.utc)
             try:
                 burn_dt = datetime.fromisoformat(
                     burn_cmd.burnTime.replace("Z", "+00:00")
@@ -230,11 +204,6 @@ class SimulationState:
 # ── Persistence ───────────────────────────────────────────────────────────────
 
 def save_state():
-    """
-    FIX: now persists last_burn_time, dry_mass_kg, pending burns, and
-         cdm_warnings so restarts don't lose mission-critical state.
-    FIX: called ONCE after a batch, not per-object.
-    """
     os.makedirs(_DATA_DIR, exist_ok=True)
 
     if not state.objects and os.path.exists(SAVE_FILE):
@@ -260,14 +229,14 @@ def save_state():
         },
         "burns": [
             {
-                "burn_id":          b.burn_id,
-                "satellite_id":     b.satellite_id,
-                "burn_time_iso":    b.burn_time_iso,
-                "burn_time_epoch":  b.burn_time_epoch,
-                "delta_v_eci":      b.delta_v_eci,
-                "executed":         b.executed,
+                "burn_id":         b.burn_id,
+                "satellite_id":    b.satellite_id,
+                "burn_time_iso":   b.burn_time_iso,
+                "burn_time_epoch": b.burn_time_epoch,
+                "delta_v_eci":     b.delta_v_eci,
+                "executed":        b.executed,
             }
-            for b in state.burns if not b.executed  # only persist pending burns
+            for b in state.burns if not b.executed
         ],
         "cdm_warnings": [
             {
@@ -286,10 +255,6 @@ def save_state():
 
 
 def load_state():
-    """
-    FIX: hot-reload guard — only loads once per process lifetime.
-    FIX: restores last_burn_time, dry_mass_kg, pending burns, cdm_warnings.
-    """
     if state._state_loaded:
         return
     state._state_loaded = True
@@ -323,7 +288,12 @@ def load_state():
             nominal_v=obj.get("nominal_v"),
         )
 
+    # FIX: purge stale SK-* burns on load — these are leftover station-keeping
+    # burns from old saves. Loading them causes satellites to show as YELLOW
+    # (pending burns) on every restart even with no active conjunction events.
     for b in data.get("burns", []):
+        if b["burn_id"].startswith("SK-"):
+            continue
         state.burns.append(ScheduledBurn(
             burn_id=b["burn_id"],
             satellite_id=b["satellite_id"],

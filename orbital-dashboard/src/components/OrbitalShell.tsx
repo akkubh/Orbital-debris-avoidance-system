@@ -9,82 +9,115 @@ interface SatelliteData {
   pending_burns?: number;
 }
 
-// Colour map:
-//   NOMINAL      → cyan    #00ffcc
-//   MANEUVERING  → yellow  #ffdd00  (burn queued or executing)
-//   EOL          → orange  #ff8800
-//   DEAD         → red     #ff2200
-//   unknown      → cyan (safe default)
-const COLOR_MAP: Record<string, string> = {
-  NOMINAL:     '#00ffcc',
-  MANEUVERING: '#ffdd00',
-  EOL:         '#ff8800',
-  DEAD:        '#ff2200',
+const STATUS_COLORS: Record<string, THREE.Color> = {
+  NOMINAL:     new THREE.Color(0x00ffee),
+  MANEUVERING: new THREE.Color(0xffee00),
+  EOL:         new THREE.Color(0xff8800),
+  DEAD:        new THREE.Color(0xff2200),
 };
 
 function getColor(sat: SatelliteData): THREE.Color {
-  const key = sat.status ?? 'NOMINAL';
-  // Also treat "has pending burns" as MANEUVERING even if status hasn't
-  // updated yet (backend status lags by one step)
-  if ((sat.pending_burns ?? 0) > 0 && key !== 'DEAD' && key !== 'EOL') {
-    return new THREE.Color(COLOR_MAP.MANEUVERING);
+  if ((sat.pending_burns ?? 0) > 0 && sat.status !== 'DEAD' && sat.status !== 'EOL') {
+    return STATUS_COLORS.MANEUVERING;
   }
-  return new THREE.Color(COLOR_MAP[key] ?? COLOR_MAP.NOMINAL);
+  return STATUS_COLORS[sat.status ?? 'NOMINAL'] ?? STATUS_COLORS.NOMINAL;
 }
 
-const MAX_INSTANCES = 10000;
+/** Generate a soft circular gradient canvas texture so points render as circles. */
+function makeCircleTexture(size = 64): THREE.Texture {
+  const canvas  = document.createElement('canvas');
+  canvas.width  = size;
+  canvas.height = size;
+  const ctx     = canvas.getContext('2d')!;
+  const r       = size / 2;
+  const grad    = ctx.createRadialGradient(r, r, 0, r, r, r);
+  grad.addColorStop(0.0,  'rgba(255,255,255,1.0)');
+  grad.addColorStop(0.5,  'rgba(255,255,255,0.9)');
+  grad.addColorStop(0.85, 'rgba(255,255,255,0.3)');
+  grad.addColorStop(1.0,  'rgba(255,255,255,0.0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, size, size);
+  const tex        = new THREE.CanvasTexture(canvas);
+  tex.needsUpdate  = true;
+  return tex;
+}
+
+const MAX_SATS      = 10000;
+const CIRCLE_TEX    = makeCircleTexture(64);
 
 export function OrbitalShell({ data }: { data: SatelliteData[] }) {
-  const meshRef = useRef<THREE.InstancedMesh>(null!);
-  const tmpObj  = useRef(new THREE.Object3D());
+  // FIX: useRef so useFrame always reads the latest data prop (not stale closure)
+  const dataRef = useRef<SatelliteData[]>(data);
+  dataRef.current = data;
 
-  // FIX: initialize the instanceColor buffer on first mount so every
-  // instance has a valid colour from frame 1.  Without this, Three.js
-  // leaves the buffer uninitialised and all satellites render grey/black
-  // regardless of what setColorAt writes later.
+  const pointsRef = useRef<THREE.Points>(null!);
+  const posAttr   = useRef<THREE.BufferAttribute | null>(null);
+  const colAttr   = useRef<THREE.BufferAttribute | null>(null);
+
   useEffect(() => {
-    if (!meshRef.current) return;
-    // Allocate the colour buffer by setting instance 0 to white.
-    // This forces Three.js to create the Float32BufferAttribute immediately.
-    meshRef.current.setColorAt(0, new THREE.Color('#ffffff'));
-    if (meshRef.current.instanceColor) {
-      meshRef.current.instanceColor.needsUpdate = true;
+    const positions = new Float32Array(MAX_SATS * 3);
+    const colors    = new Float32Array(MAX_SATS * 3);
+
+    // Default all to cyan so satellites are visible even before first data poll
+    for (let i = 0; i < MAX_SATS; i++) {
+      colors[i * 3]     = 0.0;
+      colors[i * 3 + 1] = 1.0;
+      colors[i * 3 + 2] = 0.93;
+    }
+
+    const geo = new THREE.BufferGeometry();
+    posAttr.current = new THREE.BufferAttribute(positions, 3);
+    colAttr.current = new THREE.BufferAttribute(colors, 3);
+    posAttr.current.setUsage(THREE.DynamicDrawUsage);
+    colAttr.current.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute('position', posAttr.current);
+    geo.setAttribute('color',    colAttr.current);
+    geo.setDrawRange(0, 0);
+
+    if (pointsRef.current) {
+      pointsRef.current.geometry.dispose();
+      pointsRef.current.geometry = geo;
     }
   }, []);
 
   useFrame(() => {
-    if (!meshRef.current || !data || data.length === 0) return;
+    const d = dataRef.current;
+    if (!pointsRef.current || !posAttr.current || !colAttr.current) return;
 
-    const mesh = meshRef.current;
+    const count  = Math.min(d.length, MAX_SATS);
+    const posArr = posAttr.current.array as Float32Array;
+    const colArr = colAttr.current.array as Float32Array;
 
-    data.forEach((sat, i) => {
-      if (i >= MAX_INSTANCES) return;
-
-      // Position
+    for (let i = 0; i < count; i++) {
+      const sat       = d[i];
       const [x, y, z] = sat.scaledPosition;
-      tmpObj.current.position.set(x, y, z);
-      tmpObj.current.updateMatrix();
-      mesh.setMatrixAt(i, tmpObj.current.matrix);
-
-      // Colour
-      mesh.setColorAt(i, getColor(sat));
-    });
-
-    mesh.instanceMatrix.needsUpdate = true;
-    if (mesh.instanceColor) {
-      mesh.instanceColor.needsUpdate = true;
+      posArr[i * 3]     = x;
+      posArr[i * 3 + 1] = y;
+      posArr[i * 3 + 2] = z;
+      const c           = getColor(sat);
+      colArr[i * 3]     = c.r;
+      colArr[i * 3 + 1] = c.g;
+      colArr[i * 3 + 2] = c.b;
     }
+
+    posAttr.current.needsUpdate = true;
+    colAttr.current.needsUpdate = true;
+    pointsRef.current.geometry.setDrawRange(0, count);
   });
 
   return (
-    <instancedMesh ref={meshRef} args={[undefined, undefined, MAX_INSTANCES]}>
-      <sphereGeometry args={[0.008, 8, 8]} />
-      {/*
-        vertexColors=true enables per-instance colour via setColorAt.
-        Without it all instances share the single `color` prop and
-        setColorAt has no effect.
-      */}
-      <meshBasicMaterial vertexColors transparent opacity={0.95} />
-    </instancedMesh>
+    <points ref={pointsRef}>
+      <bufferGeometry />
+      <pointsMaterial
+        vertexColors
+        map={CIRCLE_TEX}       /* circular soft-glow dot instead of square */
+        alphaMap={CIRCLE_TEX}
+        alphaTest={0.01}
+        sizeAttenuation={false}
+        size={8}
+        depthWrite={false}
+        transparent
+      />
+    </points>
   );
 }

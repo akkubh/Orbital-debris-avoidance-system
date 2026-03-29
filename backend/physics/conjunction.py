@@ -1,4 +1,3 @@
-import math
 import logging
 import numpy as np
 from dataclasses import dataclass, field
@@ -15,11 +14,13 @@ logger = logging.getLogger("ACM.Conjunction")
 CONJUNCTION_THRESHOLD_KM   = 25.0   # KD-tree first-pass screening radius (km)
 MISS_DISTANCE_THRESHOLD_KM =  5.0   # Report threshold for conjunction events
 
-# FIX B1: Reduced from 86400s/60s-step → 3600s/10s-step.
-# The 24h window with same-velocity (parallel orbit) debris never showed
-# miss < 5 km across 1440 steps, so cdm_warnings was always 0.
 RK4_HORIZON_S = 3600.0   # 1 hour
 RK4_DT_S      =   10.0   # 10-second step
+
+# Gravitational parameter — used for gravity-only debris propagation
+# to match simulate.py's debris RK4 (no J2), keeping TCA predictions
+# consistent with actual simulated debris positions.
+_MU = 398600.4418  # km³/s²
 
 
 # ── Data Structures ───────────────────────────────────────────────────────────
@@ -30,11 +31,24 @@ class ConjunctionEvent:
     debris_id:         str
     miss_distance:     float
     tca_seconds:       float
-    relative_velocity: Optional[float]       = None
-    sat_velocity:      Optional[np.ndarray]  = field(default=None, repr=False)
-    deb_velocity:      Optional[np.ndarray]  = field(default=None, repr=False)
+    relative_velocity: Optional[float]      = None
+    sat_velocity:      Optional[np.ndarray] = field(default=None, repr=False)
+    deb_velocity:      Optional[np.ndarray] = field(default=None, repr=False)
     risk_score:        float = 0.0
     risk_level:        str   = "LOW"
+
+    # FIX: disable auto-generated __eq__ to prevent numpy array ambiguity.
+    # Dataclass __eq__ calls == on each field; for np.ndarray fields this
+    # returns an array, and `if array:` raises ValueError. Since events are
+    # only sorted/iterated (never compared with ==), eq=False is safe.
+    def __eq__(self, other):
+        if not isinstance(other, ConjunctionEvent):
+            return NotImplemented
+        return (self.satellite_id == other.satellite_id and
+                self.debris_id   == other.debris_id)
+
+    def __hash__(self):
+        return hash((self.satellite_id, self.debris_id))
 
     def __post_init__(self):
         if self.relative_velocity is None and \
@@ -46,6 +60,29 @@ class ConjunctionEvent:
             )
 
 
+# ── Debris gravity-only propagator ────────────────────────────────────────────
+
+def _debris_rk4_step(state: np.ndarray, dt: float) -> np.ndarray:
+    """
+    FIX: gravity-only RK4 for debris (no J2), matching simulate.py's debris
+    propagation. Using the full J2 rk4_step for debris in TCA search caused
+    predicted positions to diverge from actual simulated debris positions,
+    giving inaccurate miss distance estimates.
+    """
+    def _deriv(s):
+        r      = s[:3]
+        v      = s[3:]
+        r_norm = np.linalg.norm(r)
+        a_grav = -_MU / r_norm**3 * r
+        return np.concatenate([v, a_grav])
+
+    k1 = _deriv(state)
+    k2 = _deriv(state + 0.5 * dt * k1)
+    k3 = _deriv(state + 0.5 * dt * k2)
+    k4 = _deriv(state + dt * k3)
+    return state + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+
+
 # ── Conjunction Screening ─────────────────────────────────────────────────────
 
 def screen_conjunctions(
@@ -53,17 +90,6 @@ def screen_conjunctions(
     debris_objects: dict,
     threshold_km: float = CONJUNCTION_THRESHOLD_KM
 ) -> List[ConjunctionEvent]:
-    """
-    Screen all satellite–debris pairs for close approaches.
-
-    FIX B1: Added t=0 near-field check before RK4 propagation.
-            If debris is already within MISS_DISTANCE_THRESHOLD_KM right now,
-            record the event immediately (TCA=0) without waiting for 24h propagation.
-            This is the key fix for test_conjunction.py always returning 0 warnings.
-
-    FIX B2: Minimum effective relative velocity floor (0.5 km/s) so that
-            parallel-orbit debris (near-zero rel-v) still scores HIGH/CRITICAL.
-    """
     events: List[ConjunctionEvent] = []
 
     if not satellites or not debris_objects:
@@ -90,10 +116,8 @@ def screen_conjunctions(
             deb_pos   = np.asarray(deb_state.r, dtype=float)
             deb_vel   = np.asarray(deb_state.v, dtype=float)
 
-            # FIX B1: Near-field check at t=0 ─────────────────────────────────
-            # If debris is ALREADY within the miss threshold, record immediately.
-            # This guarantees test_conjunction.py always fires warnings when
-            # debris is placed 50m from a satellite.
+            # Near-field check at t=0: if debris already within miss threshold,
+            # record immediately without RK4 propagation.
             current_dist = float(np.linalg.norm(sat_pos - deb_pos))
             if current_dist <= MISS_DISTANCE_THRESHOLD_KM:
                 miss_dist = current_dist
@@ -110,17 +134,17 @@ def screen_conjunctions(
             if miss_dist > MISS_DISTANCE_THRESHOLD_KM:
                 continue
 
-            # FIX B2: floor relative velocity so parallel orbits still score HIGH
-            rel_v            = float(np.linalg.norm(sat_vel - deb_vel))
-            effective_rel_v  = max(rel_v, 0.5)
+            # Floor relative velocity so parallel orbits still score HIGH
+            rel_v           = float(np.linalg.norm(sat_vel - deb_vel))
+            effective_rel_v = max(rel_v, 0.5)
 
             event = ConjunctionEvent(
-                satellite_id    = sat_id,
-                debris_id       = deb_id,
-                miss_distance   = miss_dist,
-                tca_seconds     = tca_sec,
-                sat_velocity    = sat_vel,
-                deb_velocity    = deb_vel,
+                satellite_id      = sat_id,
+                debris_id         = deb_id,
+                miss_distance     = miss_dist,
+                tca_seconds       = tca_sec,
+                sat_velocity      = sat_vel,
+                deb_velocity      = deb_vel,
                 relative_velocity = effective_rel_v,
             )
 
@@ -143,7 +167,7 @@ def screen_conjunctions(
     return events
 
 
-# ── TCA / Miss Distance ────────────────────────────────────────────────────────
+# ── TCA / Miss Distance ───────────────────────────────────────────────────────
 
 def _compute_miss_distance_and_tca(
     sat_pos: np.ndarray,
@@ -162,8 +186,10 @@ def _compute_miss_distance_and_tca(
 
     while elapsed < dt_max_s:
         step = min(dt_step, dt_max_s - elapsed)
+        # FIX: satellite uses full J2 rk4_step; debris uses gravity-only
+        # _debris_rk4_step — consistent with how simulate.py propagates each.
         sat_state = rk4_step(sat_state, step)
-        deb_state = rk4_step(deb_state, step)
+        deb_state = _debris_rk4_step(deb_state, step)
         elapsed  += step
         dist = float(np.linalg.norm(sat_state[:3] - deb_state[:3]))
         if dist < min_dist:
@@ -175,16 +201,6 @@ def _compute_miss_distance_and_tca(
 
 # ── Current Collision Check ───────────────────────────────────────────────────
 
-# FIX F: COLLISION_DISTANCE_KM reduced from 0.1 km (100 m) to 0.010 km (10 m).
-#
-# Root cause of all satellites turning grey/DEAD immediately:
-#   test_conjunction.py places debris at 0.05 km (50 m) from the satellite.
-#   The old threshold was 0.1 km → 50 m < 100 m → satellite instantly DEAD
-#   on the very first simulate/step call from the frontend poll loop,
-#   before any evasion burn could ever be scheduled or executed.
-#
-# 10 m is still a physically meaningful hard-collision threshold for LEO
-# objects while preventing false kills from close-approach test scenarios.
 COLLISION_DISTANCE_KM = 0.010   # 10 m
 
 
@@ -193,7 +209,9 @@ def check_current_collisions(satellites: list, debris: list) -> list[dict]:
     Check for actual collisions at the current simulation instant.
     Called once per simulation tick by simulate.py after propagation.
     """
-    hits = []
+    hits    = []
+    hit_sat_ids = set()   # FIX: track already-hit sats to prevent multiple
+                          # collision counts per tick before status is updated.
 
     if not satellites or not debris:
         return hits
@@ -210,6 +228,13 @@ def check_current_collisions(satellites: list, debris: list) -> list[dict]:
         if getattr(sat, "status", "NOMINAL") == "DEAD":
             continue
 
+        # FIX: skip satellites already hit this tick — their status hasn't been
+        # updated to DEAD yet (that happens after this function returns in
+        # simulate.py), so without this guard a single satellite could register
+        # multiple collision hits in one tick, inflating total_collisions.
+        if sat.id in hit_sat_ids:
+            continue
+
         sat_pos           = np.asarray(sat.r)
         candidate_indices = tree.query_ball_point(sat_pos, r=COLLISION_DISTANCE_KM)
 
@@ -224,9 +249,11 @@ def check_current_collisions(satellites: list, debris: list) -> list[dict]:
                     "deb_id":      deb.id,
                     "distance_km": round(dist_km, 6),
                 })
+                hit_sat_ids.add(sat.id)
                 logger.error(
                     f"[ACM] COLLISION DETECTED: {sat.id} ↔ {deb.id} | "
                     f"distance={dist_km * 1000:.1f} m"
                 )
+                break   # one collision per satellite per tick is enough
 
     return hits

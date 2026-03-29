@@ -1,26 +1,16 @@
 /**
- * components/SatelliteScene.tsx
- * ──────────────────────────────
- * Main 3-D scene: Earth, satellites, debris, alerts, HUD.
- *
- * FIXES APPLIED:
- *   - Import path corrected to '../services/api' (was broken)
- *   - Backend-offline detection: step interval pauses on repeated failures
- *   - DebrisShell instanceColor buffer initialized on mount (prevents wrong
- *     colors on some GPU drivers)
- *   - loadCelestrakData wired to a UI button
- *   - Mission metrics HUD (collisions, maneuvers, pending burns, sim time)
- *   - stepSimulation failure stops the interval (no silent pile-up)
- *   - Demo fallback shown with offline banner, not silently
+ * SatelliteScene.tsx — Main 3-D scene + Mission Control integration
  */
-
 import React, { useState, useEffect, useRef, Suspense } from "react";
 import * as THREE from "three";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { OrbitControls, Stars, useTexture, PerspectiveCamera } from "@react-three/drei";
 import { OrbitalShell } from "./OrbitalShell";
-import { fetchSnapshot, stepSimulation, loadCelestrakData } from "../services/api";
-import Alerts from "./Alerts";
+import MissionControl from "./MissionControl";
+import {
+  fetchSnapshot, fetchMission,
+  stepSimulation, loadCelestrakData, resetSimulation,
+} from "../services/api";
 
 // ── Earth ─────────────────────────────────────────────────────────────────────
 function Earth() {
@@ -43,132 +33,173 @@ interface ShellData {
   pending_burns?: number;
 }
 
-const MAX_DEBRIS_INSTANCES = 5000;
+const MAX_DEBRIS = 5000;
 
 function DebrisShell({ data }: { data: ShellData[] }) {
-  const meshRef = useRef<THREE.InstancedMesh>(null!);
-  const tmp     = useRef(new THREE.Object3D());
+  const dataRef   = useRef<ShellData[]>(data);
+  dataRef.current = data;
 
-  // FIX: initialize instanceColor buffer on mount to prevent wrong colors
+  const pointsRef = useRef<THREE.Points>(null!);
+  const posAttr   = useRef<THREE.BufferAttribute | null>(null);
+
+  const circleTex = useRef<THREE.Texture | null>(null);
+  if (!circleTex.current) {
+    const canvas  = document.createElement("canvas");
+    canvas.width  = canvas.height = 32;
+    const ctx     = canvas.getContext("2d")!;
+    const g       = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+    g.addColorStop(0,   "rgba(255,255,255,1)");
+    g.addColorStop(0.6, "rgba(255,255,255,0.6)");
+    g.addColorStop(1,   "rgba(255,255,255,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, 32, 32);
+    circleTex.current = new THREE.CanvasTexture(canvas);
+  }
+
   useEffect(() => {
-    if (!meshRef.current) return;
-    meshRef.current.setColorAt(0, new THREE.Color("#ff4444"));
-    if (meshRef.current.instanceColor) {
-      meshRef.current.instanceColor.needsUpdate = true;
+    const geo   = new THREE.BufferGeometry();
+    const pos   = new Float32Array(MAX_DEBRIS * 3);
+    posAttr.current = new THREE.BufferAttribute(pos, 3);
+    posAttr.current.setUsage(THREE.DynamicDrawUsage);
+    geo.setAttribute("position", posAttr.current);
+    geo.setDrawRange(0, 0);
+    if (pointsRef.current) {
+      pointsRef.current.geometry.dispose();
+      pointsRef.current.geometry = geo;
     }
   }, []);
 
   useFrame(() => {
-    if (!meshRef.current || !data?.length) return;
-    const count = Math.min(data.length, MAX_DEBRIS_INSTANCES);
+    const d = dataRef.current;
+    if (!pointsRef.current || !posAttr.current) return;
+    if (!d?.length) { pointsRef.current.geometry.setDrawRange(0, 0); return; }
+    const count  = Math.min(d.length, MAX_DEBRIS);
+    const posArr = posAttr.current.array as Float32Array;
     for (let i = 0; i < count; i++) {
-      const [x, y, z] = data[i].scaledPosition;
-      tmp.current.position.set(x, y, z);
-      tmp.current.updateMatrix();
-      meshRef.current.setMatrixAt(i, tmp.current.matrix);
+      const [x, y, z]   = d[i].scaledPosition;
+      posArr[i * 3]     = x;
+      posArr[i * 3 + 1] = y;
+      posArr[i * 3 + 2] = z;
     }
-    meshRef.current.instanceMatrix.needsUpdate = true;
+    posAttr.current.needsUpdate = true;
+    pointsRef.current.geometry.setDrawRange(0, count);
   });
 
   return (
-    <instancedMesh ref={meshRef} args={[undefined, undefined, MAX_DEBRIS_INSTANCES]}>
-      <sphereGeometry args={[0.004, 6, 6]} />
-      <meshBasicMaterial color="#ff4444" transparent opacity={0.7} />
-    </instancedMesh>
+    <points ref={pointsRef}>
+      <bufferGeometry />
+      <pointsMaterial
+        color="#ff5555"
+        map={circleTex.current}
+        alphaMap={circleTex.current}
+        alphaTest={0.01}
+        sizeAttenuation={false}
+        size={4}
+        depthWrite={false}
+        transparent
+      />
+    </points>
   );
 }
 
-// ── Metrics HUD ───────────────────────────────────────────────────────────────
-interface Metrics {
-  total_collisions: number;
-  total_maneuvers_executed: number;
-  pending_burns: number;
-  sim_epoch: number;
-  sim_time: string | null;
-}
-
-function MetricsHUD({ metrics, offline }: { metrics: Metrics; offline: boolean }) {
+// ── Metrics HUD (bottom-left) ─────────────────────────────────────────────────
+function MetricsHUD({ metrics, offline }: { metrics: any; offline: boolean }) {
+  const t = metrics.sim_time
+    ? new Date(metrics.sim_time).toUTCString().slice(5, 25)
+    : "—";
   return (
     <div style={{
       position: "absolute", bottom: 10, left: 10,
-      background: "rgba(10,10,20,0.85)", backdropFilter: "blur(8px)",
+      background: "rgba(10,10,20,0.88)", backdropFilter: "blur(8px)",
       padding: "10px 14px", color: "white", borderRadius: 8,
-      border: "1px solid rgba(0,200,255,0.3)", fontFamily: "monospace",
+      border: "1px solid rgba(0,200,255,0.2)", fontFamily: "monospace",
       fontSize: 11, zIndex: 100, pointerEvents: "none", minWidth: 220,
     }}>
-      {offline && (
-        <div style={{ color: "#ff8888", marginBottom: 6 }}>⚠️ Backend offline</div>
-      )}
-      <div style={{ color: "#00ccff", marginBottom: 4, fontSize: 12 }}>📡 ACM Mission Status</div>
-      <div>🕐 Sim time: {metrics.sim_time ? new Date(metrics.sim_time).toUTCString().slice(17, 25) : "—"}</div>
-      <div>⏱  Sim epoch: {metrics.sim_epoch.toFixed(0)}s</div>
-      <div>💥 Collisions: {metrics.total_collisions}</div>
-      <div>🚀 Maneuvers executed: {metrics.total_maneuvers_executed}</div>
-      <div>⏳ Pending burns: {metrics.pending_burns}</div>
+      {offline && <div style={{ color: "#ff8888", marginBottom: 5 }}>⚠️ Backend offline</div>}
+      <div style={{ color: "#00ccff", marginBottom: 6, fontSize: 12, fontWeight: "bold" }}>
+        📡 ACM Status
+      </div>
+      <div>🕐 {t}</div>
+      <div>⏱  Epoch: {(metrics.sim_epoch ?? 0).toFixed(0)}s</div>
+      <div>💥 Collisions: {metrics.total_collisions ?? 0}</div>
+      <div>🚀 Maneuvers: {metrics.total_maneuvers_executed ?? 0}</div>
+      <div>⏳ Pending burns: {metrics.pending_burns ?? 0}</div>
     </div>
   );
 }
 
-// ── SatelliteScene ─────────────────────────────────────────────────────────────
+// ── SatelliteScene ────────────────────────────────────────────────────────────
 export default function SatelliteScene() {
   const [satData,    setSatData]    = useState<ShellData[]>([]);
   const [debrisData, setDebrisData] = useState<ShellData[]>([]);
-  const [alerts,     setAlerts]     = useState<{ message: string }[]>([]);
-  const [metrics,    setMetrics]    = useState<Metrics>({
+  const [metrics,    setMetrics]    = useState<any>({
     total_collisions: 0, total_maneuvers_executed: 0,
     pending_burns: 0, sim_epoch: 0, sim_time: null,
   });
+  const [mission,    setMission]    = useState<any>(null);
   const [offline,    setOffline]    = useState(false);
   const [celestrakLoading, setCelestrakLoading] = useState(false);
+  const [resetting,        setResetting]        = useState(false);
 
-  const stepFailCountRef = useRef(0);
-  const MAX_STEP_FAILS   = 3;
-  const SIM_STEP_INTERVAL_MS = 5000;
+  const stepFailRef      = useRef(0);
+  const prevCollisionsRef = useRef(0);
+  const MAX_FAILS        = 3;
 
   useEffect(() => {
-    const loadSnapshot = async () => {
+    // ── Snapshot poll: positions + metrics every 1s ───────────────────────
+    const snapPoll = setInterval(async () => {
       try {
         const result = await fetchSnapshot();
-        setSatData(result.satellites    || []);
-        setDebrisData(result.debris     || []);
-        setAlerts(result.cdm_warnings   || []);
+        setSatData(result.satellites  || []);
+        setDebrisData(result.debris   || []);
         setMetrics(result.metrics);
         setOffline(false);
-        stepFailCountRef.current = 0;
+        stepFailRef.current = 0;
       } catch {
         setOffline(true);
       }
-    };
+    }, 1000);
 
-    loadSnapshot();
-    const snapshotInterval = setInterval(loadSnapshot, 1000);
+    // ── Mission poll: CDM / burns / health every 2s ───────────────────────
+    const missionPoll = setInterval(async () => {
+      try {
+        const m = await fetchMission();
+        setMission(m);
+      } catch {}
+    }, 2000);
 
-    // FIX: step interval self-pauses after repeated backend failures
-    const stepInterval = setInterval(async () => {
-      if (stepFailCountRef.current >= MAX_STEP_FAILS) return;
+    // ── Sim step every 5s (skip when tab hidden) ──────────────────────────
+    const stepPoll = setInterval(async () => {
+      if (document.hidden) return;
+      if (stepFailRef.current >= MAX_FAILS) return;
       try {
         await stepSimulation(10);
-        stepFailCountRef.current = 0;
+        stepFailRef.current = 0;
       } catch {
-        stepFailCountRef.current += 1;
-        if (stepFailCountRef.current >= MAX_STEP_FAILS) {
-          console.warn("ACM: backend step failing — pausing step interval");
-          setOffline(true);
-        }
+        stepFailRef.current += 1;
+        if (stepFailRef.current >= MAX_FAILS) setOffline(true);
       }
-    }, SIM_STEP_INTERVAL_MS);
+    }, 5000);
+
+    // Trigger first fetches immediately
+    fetchSnapshot().then(r => {
+      setSatData(r.satellites || []);
+      setDebrisData(r.debris  || []);
+      setMetrics(r.metrics);
+    }).catch(() => setOffline(true));
+    fetchMission().then(setMission).catch(() => {});
 
     return () => {
-      clearInterval(snapshotInterval);
-      clearInterval(stepInterval);
+      clearInterval(snapPoll);
+      clearInterval(missionPoll);
+      clearInterval(stepPoll);
     };
   }, []);
 
   const handleLoadCelestrak = async () => {
     setCelestrakLoading(true);
     try {
-      const res = await loadCelestrakData(500, 50);
-      console.log("CelesTrak loaded:", res);
+      await loadCelestrakData(500, 50);
     } catch (e) {
       console.error("CelesTrak load failed:", e);
     } finally {
@@ -176,23 +207,53 @@ export default function SatelliteScene() {
     }
   };
 
+  const handleReset = async () => {
+    // Immediately clear UI
+    setSatData([]);
+    setDebrisData([]);
+    setMission(null);
+    setMetrics({ total_collisions: 0, total_maneuvers_executed: 0,
+                 pending_burns: 0, sim_epoch: 0, sim_time: null });
+    setOffline(false);
+    stepFailRef.current = 0;
+    prevCollisionsRef.current = 0;
+    setResetting(true);
+    try { await resetSimulation(); } catch (e) { console.error("Reset:", e); }
+    finally { setResetting(false); }
+  };
+
+  const btnBase: React.CSSProperties = {
+    position: "absolute", top: 10, zIndex: 150,
+    background: "rgba(10,10,20,0.9)", backdropFilter: "blur(6px)",
+    padding: "6px 14px", borderRadius: 6,
+    fontFamily: "monospace", fontSize: 12, cursor: "pointer",
+  };
+
   return (
     <div style={{ width: "100vw", height: "100vh", background: "#000", position: "relative" }}>
-      <Alerts alerts={alerts} />
       <MetricsHUD metrics={metrics} offline={offline} />
 
-      {/* CelesTrak load button */}
+      <MissionControl
+        mission={mission}
+        simEpoch={metrics.sim_epoch ?? 0}
+        prevCollisions={prevCollisionsRef.current}
+        onCollisionSeen={(n: number) => { prevCollisionsRef.current = n; }}
+      />
+
+      {/* Buttons */}
       <button
         onClick={handleLoadCelestrak}
         disabled={celestrakLoading}
-        style={{
-          position: "absolute", top: 10, left: 10, zIndex: 100,
-          background: "rgba(10,10,20,0.85)", border: "1px solid rgba(0,200,255,0.4)",
-          color: "#00ccff", padding: "6px 12px", borderRadius: 6,
-          fontFamily: "monospace", fontSize: 12, cursor: "pointer",
-        }}
+        style={{ ...btnBase, left: 10, border: "1px solid rgba(0,200,255,0.4)", color: "#00ccff" }}
       >
         {celestrakLoading ? "Loading…" : "🛰️ Load CelesTrak"}
+      </button>
+      <button
+        onClick={handleReset}
+        disabled={resetting}
+        style={{ ...btnBase, left: 170, border: "1px solid rgba(255,80,80,0.4)", color: "#ff6666" }}
+      >
+        {resetting ? "Resetting…" : "🗑️ Reset State"}
       </button>
 
       <Canvas flat>
@@ -202,14 +263,12 @@ export default function SatelliteScene() {
         <pointLight position={[10, 10, 10]} intensity={2.0} />
         <directionalLight position={[-5, 3, 5]} intensity={1.5} />
 
-        <Suspense
-          fallback={
-            <mesh>
-              <sphereGeometry args={[1, 32, 32]} />
-              <meshBasicMaterial color="#112244" wireframe />
-            </mesh>
-          }
-        >
+        <Suspense fallback={
+          <mesh>
+            <sphereGeometry args={[1, 32, 32]} />
+            <meshBasicMaterial color="#112244" wireframe />
+          </mesh>
+        }>
           <Earth />
         </Suspense>
 
@@ -217,7 +276,7 @@ export default function SatelliteScene() {
         <DebrisShell  data={debrisData} />
 
         <Stars radius={300} count={7000} factor={7} saturation={0} fade speed={1} />
-        <OrbitControls enablePan={false} minDistance={1.5} maxDistance={15} />
+        <OrbitControls enablePan={false} minDistance={1.5} maxDistance={20} />
       </Canvas>
     </div>
   );

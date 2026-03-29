@@ -2,22 +2,9 @@
 api/simulate.py
 ━━━━━━━━━━━━━━━
 Simulation step & visualization snapshot for ACM
-
-FIXES APPLIED:
-  - EOL graveyard burn no longer causes re-entry into EOL block next tick
-    (status stays EOL after _execute_burn, not reset to MANEUVERING→NOMINAL)
-  - Station-keeping recovery: plan_recovery_burn now called correctly
-    (nominal_r/v always set, so zero-vector fallback no longer happens)
-  - MANEUVERING → NOMINAL clear respects EOL and DEAD
-  - save_state() called once per tick, not inside update_satellite per-object
-  - Debris objects are NOT RK4-propagated every tick (major perf fix)
-    Only satellites are propagated; debris use linear drift approximation
-  - burn_time_iso set to a valid ISO string for graveyard/SK burns
-  - total_collisions and total_maneuvers_executed exposed in snapshot
 """
 
 import logging
-import uuid
 import numpy as np
 from fastapi import APIRouter
 from datetime import datetime, timezone, timedelta
@@ -27,17 +14,25 @@ from models.schemas import (
 )
 from models.state_store import (
     state, save_state,
-    INITIAL_FUEL_KG, EOL_FUEL_FRAC, STATION_BOX_KM,
-    SIGNAL_LATENCY, THRUSTER_COOLDOWN,
+    INITIAL_FUEL_KG, EOL_FUEL_FRAC,
 )
 from physics.propagator import rk4_step
-from physics.maneuver_calc import fuel_consumed, plan_graveyard_burn, plan_recovery_burn
+from physics.maneuver_calc import fuel_consumed, plan_graveyard_burn
 from physics.conjunction import check_current_collisions
 
 router = APIRouter()
 log    = logging.getLogger("simulate")
 
-PROPAGATION_DT = 10.0   # RK4 sub-step (seconds)
+PROPAGATION_DT = 10.0        # RK4 sub-step (seconds)
+MU             = 398600.4418  # km³/s²
+
+
+# FIX: _deriv moved out of the while loop — was being redefined on every
+# sub-step iteration, which is wasteful and obscures the logic.
+def _deriv(r_b, v_b):
+    r_norms = np.linalg.norm(r_b, axis=1, keepdims=True)
+    a_grav  = -MU / (r_norms ** 3) * r_b
+    return v_b, a_grav
 
 
 @router.post("/api/simulate/step", response_model=SimStepResponse)
@@ -64,18 +59,33 @@ async def simulate_step(payload: SimStepRequest):
                     _execute_burn(sat, burn)
                     maneuvers_executed += 1
 
-        # ── Propagate satellites only (RK4) ───────────────────────────────────
-        # FIX: debris objects are propagated with cheap linear drift.
-        # Full RK4 on 500 debris every 10s tick was the main perf bottleneck.
-        for obj in state.objects.values():
-            if obj.type == "SAT":
-                s = np.array(obj.r + obj.v, dtype=float)
-                s = rk4_step(s, dt)
-                obj.r = s[:3].tolist()
-                obj.v = s[3:].tolist()
-            else:
-                # Linear drift for debris: r += v * dt (cheap, good enough for screening)
-                obj.r = [obj.r[i] + obj.v[i] * dt for i in range(3)]
+        # ── Propagate satellites (full RK4 + J2) ─────────────────────────────
+        sat_objects = [o for o in state.objects.values() if o.type == "SAT"]
+        deb_objects = [o for o in state.objects.values() if o.type == "DEBRIS"]
+
+        for obj in sat_objects:
+            # FIX: ensure r and v are plain float lists before concatenation
+            s = np.array(list(obj.r) + list(obj.v), dtype=float)
+            s = rk4_step(s, dt)
+            obj.r = s[:3].tolist()
+            obj.v = s[3:].tolist()
+
+        # ── Propagate debris (vectorised 2-body RK4, no J2) ──────────────────
+        if deb_objects:
+            rs = np.array([d.r for d in deb_objects], dtype=float)  # (N,3)
+            vs = np.array([d.v for d in deb_objects], dtype=float)  # (N,3)
+
+            v1, a1 = _deriv(rs,               vs)
+            v2, a2 = _deriv(rs + 0.5*dt*v1,   vs + 0.5*dt*a1)
+            v3, a3 = _deriv(rs + 0.5*dt*v2,   vs + 0.5*dt*a2)
+            v4, a4 = _deriv(rs + dt*v3,        vs + dt*a3)
+
+            rs_new = rs + (dt/6.0) * (v1 + 2*v2 + 2*v3 + v4)
+            vs_new = vs + (dt/6.0) * (a1 + 2*a2 + 2*a3 + a4)
+
+            for i, obj in enumerate(deb_objects):
+                obj.r = rs_new[i].tolist()
+                obj.v = vs_new[i].tolist()
 
         state.sim_epoch += dt
         elapsed         += dt
@@ -120,7 +130,7 @@ async def simulate_step(payload: SimStepRequest):
 
 
 def _execute_burn(sat, burn):
-    """Apply ΔV, deduct fuel. Does NOT change status to MANEUVERING for EOL sats."""
+    """Apply ΔV, deduct fuel. Keeps EOL status — does not reset to MANEUVERING."""
     dv_eci = np.array(burn.delta_v_eci, dtype=float)
     dv_mag = float(np.linalg.norm(dv_eci))
 
@@ -130,8 +140,7 @@ def _execute_burn(sat, burn):
     sat.last_burn_time = burn.burn_time_epoch
     burn.executed      = True
 
-    # FIX: only set MANEUVERING if satellite is not already EOL/DEAD
-    # Prevents EOL sat cycling MANEUVERING → EOL check re-fires → duplicate burns
+    # Only set MANEUVERING if satellite is not already EOL/DEAD
     if sat.status not in ("EOL", "DEAD"):
         sat.status = "MANEUVERING"
 
@@ -143,18 +152,34 @@ def _execute_burn(sat, burn):
 
 
 def _update_satellite_statuses():
+    """
+    Status machine per tick:
+      DEAD        → stays DEAD (skip all)
+      EOL         → stays EOL (graveyard burn already scheduled once)
+      fuel<=0     → force EOL immediately regardless of current status,
+                    so a burn that depletes all fuel doesn't leave the
+                    satellite stuck in MANEUVERING with 0 kg forever.
+      fuel<5%     → transition to EOL, schedule graveyard burn ONCE
+      MANEUVERING + no pending burns → NOMINAL
+      otherwise   → NOMINAL
+    """
     for sat in state.get_satellites():
         if sat.status == "DEAD":
             continue
 
+        # FIX: force EOL if fuel is completely gone regardless of current status.
+        # Previously a satellite that burned its last fuel stayed MANEUVERING
+        # forever because the EOL check excluded MANEUVERING status.
+        if sat.fuel_kg <= 0.0 and sat.status not in ("EOL", "DEAD"):
+            sat.status = "EOL"
+            log.warning(f"Satellite {sat.id} fuel depleted — forced to EOL")
+
         # ── EOL check ─────────────────────────────────────────────────────────
-        # FIX: check status not in (EOL, MANEUVERING) to prevent re-scheduling
-        # graveyard burn every tick after the burn has already executed
+        # Only transition once: not already EOL and not mid-burn
         if sat.fuel_fraction < EOL_FUEL_FRAC and sat.status not in ("EOL", "MANEUVERING"):
             sat.status = "EOL"
             graveyard  = plan_graveyard_burn(sat, state.sim_epoch)
             if graveyard:
-                # FIX: generate valid ISO string for burn_time_iso
                 base = datetime.fromisoformat(
                     state.sim_time.replace("Z", "+00:00")
                 ) if state.sim_time else datetime.now(timezone.utc)
@@ -172,63 +197,13 @@ def _update_satellite_statuses():
                 ))
                 log.warning(f"EOL graveyard burn scheduled for {sat.id}")
 
-        # ── Station-keeping ────────────────────────────────────────────────────
-        # nominal_r is now always set (fixed in state_store.update_satellite)
-        if sat.nominal_r and sat.status not in ("MANEUVERING", "EOL", "DEAD"):
-            dist_from_slot = float(np.linalg.norm(
-                np.array(sat.r) - np.array(sat.nominal_r)
-            ))
-            if dist_from_slot <= STATION_BOX_KM:
-                sat.status = "NOMINAL"
-            else:
-                log.warning(
-                    f"Station-keeping violation: {sat.id} is "
-                    f"{dist_from_slot:.2f} km from slot"
-                )
-                # FIX: plan_recovery_burn now receives actual evasion dv (zeros
-                # means "no evasion happened, just drift") — with nominal_r/v set,
-                # the function computes a real velocity correction, not a zero vector
-                recovery_dv = plan_recovery_burn(np.zeros(3), sat=sat)
-                dv_mag = float(np.linalg.norm(recovery_dv))
-                if dv_mag < 1e-9:
-                    log.warning(f"Station-keeping: zero recovery ΔV for {sat.id} — skipping")
-                    continue
-
-                earliest_burn = state.sim_epoch + SIGNAL_LATENCY
-                if sat.last_burn_time is not None:
-                    earliest_burn = max(
-                        earliest_burn,
-                        sat.last_burn_time + THRUSTER_COOLDOWN,
-                    )
-
-                # FIX: valid ISO string for burn_time_iso
-                base = datetime.fromisoformat(
-                    state.sim_time.replace("Z", "+00:00")
-                ) if state.sim_time else datetime.now(timezone.utc)
-                burn_iso = (
-                    base + timedelta(seconds=earliest_burn - state.sim_epoch)
-                ).isoformat()
-
-                from models.state_store import ScheduledBurn
-                burn_id = f"SK-{sat.id}-{uuid.uuid4().hex[:6].upper()}"
-                state.burns.append(ScheduledBurn(
-                    burn_id=burn_id,
-                    satellite_id=sat.id,
-                    burn_time_iso=burn_iso,
-                    burn_time_epoch=earliest_burn,
-                    delta_v_eci=recovery_dv.tolist(),
-                ))
-                state.burns.sort(key=lambda b: b.burn_time_epoch)
-                sat.status = "MANEUVERING"
-
-        # ── Clear MANEUVERING if no pending burns — respect EOL/DEAD ──────────
-        # FIX: only reset to NOMINAL if not EOL or DEAD
+        # ── Clear MANEUVERING when all burns done ─────────────────────────────
         if sat.status == "MANEUVERING":
             if not state.pending_burns_for(sat.id):
                 sat.status = "NOMINAL"
 
 
-# ── Visualization snapshot ─────────────────────────────────────────────────────
+# ── Visualization snapshot ────────────────────────────────────────────────────
 
 @router.get("/api/visualization/snapshot", response_model=VisualizationSnapshot)
 async def visualization_snapshot():

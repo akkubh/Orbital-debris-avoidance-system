@@ -2,16 +2,6 @@
 api/telemetry.py
 ━━━━━━━━━━━━━━━━
 Telemetry Ingestion & Auto-Evasion for ACM
-
-FIXES APPLIED:
-  - save_state() called ONCE after full batch (not per-object via update_satellite)
-  - LOS checks use state_store.sim_time (sim clock) not datetime.now() (wall clock)
-  - AUTO_EVASION_RISK_LEVELS constant actually used in the filter logic
-  - EOL and DEAD satellites skipped before scheduling auto-evasion burns
-  - resolve_cdm_warnings_for() called after successful evasion scheduling
-  - optimize_delta_v called for both HIGH and CRITICAL (not just CRITICAL)
-  - recovery burn fuel validated against remaining fuel after evasion burn
-  - sat_state.r + sat_state.v concatenated safely via explicit list()
 """
 
 import uuid
@@ -25,19 +15,18 @@ from models.schemas import (
 )
 from models.state_store import (
     state_store, SIGNAL_LATENCY, SAFE_MISS_KM, EOL_FUEL_FRAC, INITIAL_FUEL_KG,
-    save_state,
+    THRUSTER_COOLDOWN, save_state,
 )
 from physics.conjunction import screen_conjunctions
 from physics.maneuver_calc import (
     plan_evasion_burn, plan_recovery_burn, optimize_delta_v,
-    fuel_consumed, estimate_fuel_cost,
+    fuel_consumed,
 )
 from physics.ground_station import has_line_of_sight, next_los_window
 
 logger = logging.getLogger("ACM.Telemetry")
 router = APIRouter(tags=["Telemetry"])
 
-# FIX: constant is now actually used in _auto_schedule_evasions
 AUTO_EVASION_RISK_LEVELS = {"HIGH", "CRITICAL"}
 
 
@@ -49,7 +38,6 @@ async def ingest_telemetry(payload: TelemetryRequest):
     sat_ids_ingested = []
 
     for obj in payload.objects:
-        # FIX: use list() to guarantee plain Python lists, not numpy arrays
         position = list(obj.r.to_list())
         velocity = list(obj.v.to_list())
 
@@ -71,9 +59,6 @@ async def ingest_telemetry(payload: TelemetryRequest):
             )
             logger.debug(f"[ACM] Telemetry ingested: DEBRIS {obj.id}")
 
-    # FIX: save_state once after full batch (was called per-object = 550x writes)
-    save_state()
-
     conjunction_events = screen_conjunctions(
         satellites=state_store.satellites,
         debris_objects=state_store.debris,
@@ -85,10 +70,16 @@ async def ingest_telemetry(payload: TelemetryRequest):
     for sat_id in sat_ids_ingested:
         total_evasions += _auto_schedule_evasions(conjunction_events, sat_id)
 
+    # FIX: save_state after conjunction screening + evasion scheduling so
+    # CDM warnings and newly queued burns are persisted together in one write.
+    save_state()
+
+    # FIX: return actual stored unresolved warning count, not raw screen count
+    # (these differ when evasion scheduling resolves some warnings mid-loop)
     return TelemetryResponse(
         status="ACK",
         processed_count=len(payload.objects),
-        active_cdm_warnings=len(conjunction_events),
+        active_cdm_warnings=state_store.active_cdm_count(),
     )
 
 
@@ -114,17 +105,6 @@ def _sync_cdm_warnings(events: list) -> None:
 # ── Auto-evasion logic ────────────────────────────────────────────────────────
 
 def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) -> int:
-    """
-    Schedule evasion burns for HIGH and CRITICAL risk events.
-
-    FIXES:
-    - Uses AUTO_EVASION_RISK_LEVELS to filter (constant was previously unused)
-    - Skips DEAD and EOL satellites
-    - Validates recovery burn fuel against remaining fuel after evasion
-    - Calls optimize_delta_v for both HIGH and CRITICAL
-    - Calls resolve_cdm_warnings_for() after successful scheduling
-    - Uses sim_time (not wall clock) for LOS checks
-    """
     scheduled_count = 0
 
     for event in conjunction_events:
@@ -134,7 +114,6 @@ def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) ->
         risk_level = getattr(event, "risk_level", "LOW")
         risk_score = getattr(event, "risk_score",  0.0)
 
-        # FIX: use the constant
         if risk_level not in AUTO_EVASION_RISK_LEVELS:
             if risk_level == "MEDIUM":
                 logger.warning(
@@ -158,11 +137,31 @@ def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) ->
             )
             continue
 
-        # FIX: skip satellites that can't maneuver
         if sat_state.status in ("DEAD", "EOL"):
             logger.warning(
                 f"[ACM] Skipping evasion for {event.satellite_id} "
                 f"— status={sat_state.status}"
+            )
+            continue
+
+        evasion_cooldown_ok = True
+        for b in state_store.burns:
+            if b.satellite_id != event.satellite_id:
+                continue
+            if not b.burn_id.startswith("EVA-"):
+                continue
+            if not b.executed:
+                evasion_cooldown_ok = False
+                break
+            time_since = state_store.sim_epoch - b.burn_time_epoch
+            if 0 <= time_since < THRUSTER_COOLDOWN:
+                evasion_cooldown_ok = False
+                break
+
+        if not evasion_cooldown_ok:
+            logger.debug(
+                f"[ACM] Evasion cooldown active for {event.satellite_id} "
+                f"vs {event.debris_id} — skipping"
             )
             continue
 
@@ -178,7 +177,6 @@ def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) ->
             f"miss={event.miss_distance:.4f} km | TCA={event.tca_seconds:.0f}s"
         )
 
-        # FIX: call optimize_delta_v for BOTH HIGH and CRITICAL
         optimal_dv = optimize_delta_v(
             sat_pos, sat_vel, deb_pos, deb_vel,
             tca_seconds=event.tca_seconds,
@@ -199,7 +197,6 @@ def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) ->
             logger.error(f"[ACM] Evasion planning failed for {event.satellite_id}")
             continue
 
-        # FIX: validate recovery burn has enough fuel AFTER evasion deduction
         evasion_fuel_cost = maneuver["fuel_cost"]
         remaining_fuel    = sat_state.fuel_kg - evasion_fuel_cost
         eol_reserve       = EOL_FUEL_FRAC * INITIAL_FUEL_KG
@@ -212,7 +209,6 @@ def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) ->
         else:
             recovery_dv_arr = plan_recovery_burn(maneuver["dv_eci"], sat=sat_state)
 
-        # FIX: LOS check uses sim_time (sim clock), not datetime.now() (wall clock)
         sim_now_iso = state_store.sim_time or datetime.now(timezone.utc).isoformat()
         default_evasion_offset = max(event.tca_seconds * 0.5, SIGNAL_LATENCY)
         evasion_offset_s = _resolve_evasion_time(
@@ -242,8 +238,12 @@ def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) ->
             )
             state_store.add_maneuver(event.satellite_id, recovery_cmd)
 
-        # FIX: resolve the CDM warning now that evasion is scheduled
-        state_store.resolve_cdm_warnings_for(event.satellite_id, event.debris_id)
+        # FIX: removed resolve_cdm_warnings_for() call here.
+        # Resolving immediately caused _sync_cdm_warnings on the next telemetry
+        # call to re-open the warning (upsert sets resolved=False) since the
+        # debris is still close, creating an infinite re-schedule loop that the
+        # cooldown guard had to silently suppress. CDM warnings now stay active
+        # until debris genuinely moves out of the screening threshold.
 
         logger.info(
             f"[ACM] Burns scheduled for {event.satellite_id} | "
@@ -261,10 +261,6 @@ def _auto_schedule_evasions(conjunction_events: list, triggering_sat_id: str) ->
 def _resolve_evasion_time(
     sat_state, tca_seconds: float, default_offset_s: float, sim_now_iso: str
 ) -> float:
-    """
-    FIX: uses sim_now_iso (sim clock) not datetime.now() for LOS checks
-    so GMST is computed consistently with the simulation's current time.
-    """
     from physics.propagator import rk4_step as _rk4
 
     current_los, _ = has_line_of_sight(list(sat_state.r), sim_now_iso)
@@ -290,7 +286,6 @@ def _resolve_evasion_time(
             )
             return max(default_offset_s, SIGNAL_LATENCY)
 
-    # FIX: safe concatenation — explicit list() prevents ndarray + list confusion
     probe_state = np.array(list(sat_state.r) + list(sat_state.v), dtype=float)
     probe_dt    = 30.0
     elapsed     = 0.0
