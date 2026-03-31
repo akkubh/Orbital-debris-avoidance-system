@@ -59,6 +59,7 @@ class ManeuverValidation(BaseModel):
 class ManeuverResponse(BaseModel):
     status: str
     validation: ManeuverValidation
+    reject_reason: str = ""    # populated when status="REJECTED", empty otherwise
 
 
 class SimStepRequest(BaseModel):

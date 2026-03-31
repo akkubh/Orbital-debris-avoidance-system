@@ -35,26 +35,30 @@ interface ShellData {
 
 const MAX_DEBRIS = 5000;
 
+// FIX: circleTex created once at module level, not inside the component render
+// body. Creating it inside the component (even with a ref guard) is a side
+// effect in render which React StrictMode double-invokes, leaking a canvas
+// texture on every dev mount. Module-level creation runs exactly once.
+function makeCircleTex(): THREE.Texture {
+  const canvas      = document.createElement("canvas");
+  canvas.width      = canvas.height = 32;
+  const ctx         = canvas.getContext("2d")!;
+  const g           = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+  g.addColorStop(0,   "rgba(255,255,255,1)");
+  g.addColorStop(0.6, "rgba(255,255,255,0.6)");
+  g.addColorStop(1,   "rgba(255,255,255,0)");
+  ctx.fillStyle     = g;
+  ctx.fillRect(0, 0, 32, 32);
+  return new THREE.CanvasTexture(canvas);
+}
+const DEBRIS_CIRCLE_TEX = makeCircleTex();
+
 function DebrisShell({ data }: { data: ShellData[] }) {
   const dataRef   = useRef<ShellData[]>(data);
   dataRef.current = data;
 
   const pointsRef = useRef<THREE.Points>(null!);
   const posAttr   = useRef<THREE.BufferAttribute | null>(null);
-
-  const circleTex = useRef<THREE.Texture | null>(null);
-  if (!circleTex.current) {
-    const canvas  = document.createElement("canvas");
-    canvas.width  = canvas.height = 32;
-    const ctx     = canvas.getContext("2d")!;
-    const g       = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
-    g.addColorStop(0,   "rgba(255,255,255,1)");
-    g.addColorStop(0.6, "rgba(255,255,255,0.6)");
-    g.addColorStop(1,   "rgba(255,255,255,0)");
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, 32, 32);
-    circleTex.current = new THREE.CanvasTexture(canvas);
-  }
 
   useEffect(() => {
     const geo   = new THREE.BufferGeometry();
@@ -90,8 +94,8 @@ function DebrisShell({ data }: { data: ShellData[] }) {
       <bufferGeometry />
       <pointsMaterial
         color="#ff5555"
-        map={circleTex.current}
-        alphaMap={circleTex.current}
+        map={DEBRIS_CIRCLE_TEX}
+        alphaMap={DEBRIS_CIRCLE_TEX}
         alphaTest={0.01}
         sizeAttenuation={false}
         size={4}
@@ -141,22 +145,30 @@ export default function SatelliteScene() {
   const [celestrakLoading, setCelestrakLoading] = useState(false);
   const [resetting,        setResetting]        = useState(false);
 
-  const stepFailRef      = useRef(0);
+  const stepFailRef       = useRef(0);
   const prevCollisionsRef = useRef(0);
-  const MAX_FAILS        = 3;
+  const MAX_FAILS         = 3;
 
   useEffect(() => {
+    // FIX: isMounted guard prevents setState calls on unmounted component.
+    // Without this, the immediate fetchSnapshot/fetchMission calls at the
+    // bottom of the effect resolve after unmount (e.g. in StrictMode double
+    // invoke) and trigger "Can't perform a React state update on an unmounted
+    // component" warnings and potential memory leaks.
+    let isMounted = true;
+
     // ── Snapshot poll: positions + metrics every 1s ───────────────────────
     const snapPoll = setInterval(async () => {
       try {
         const result = await fetchSnapshot();
+        if (!isMounted) return;
         setSatData(result.satellites  || []);
         setDebrisData(result.debris   || []);
         setMetrics(result.metrics);
         setOffline(false);
         stepFailRef.current = 0;
       } catch {
-        setOffline(true);
+        if (isMounted) setOffline(true);
       }
     }, 1000);
 
@@ -164,7 +176,7 @@ export default function SatelliteScene() {
     const missionPoll = setInterval(async () => {
       try {
         const m = await fetchMission();
-        setMission(m);
+        if (isMounted) setMission(m);
       } catch {}
     }, 2000);
 
@@ -177,19 +189,24 @@ export default function SatelliteScene() {
         stepFailRef.current = 0;
       } catch {
         stepFailRef.current += 1;
-        if (stepFailRef.current >= MAX_FAILS) setOffline(true);
+        if (stepFailRef.current >= MAX_FAILS && isMounted) setOffline(true);
       }
     }, 5000);
 
     // Trigger first fetches immediately
     fetchSnapshot().then(r => {
+      if (!isMounted) return;
       setSatData(r.satellites || []);
       setDebrisData(r.debris  || []);
       setMetrics(r.metrics);
-    }).catch(() => setOffline(true));
-    fetchMission().then(setMission).catch(() => {});
+    }).catch(() => { if (isMounted) setOffline(true); });
+
+    fetchMission().then(m => {
+      if (isMounted) setMission(m);
+    }).catch(() => {});
 
     return () => {
+      isMounted = false;
       clearInterval(snapPoll);
       clearInterval(missionPoll);
       clearInterval(stepPoll);
@@ -208,7 +225,6 @@ export default function SatelliteScene() {
   };
 
   const handleReset = async () => {
-    // Immediately clear UI
     setSatData([]);
     setDebrisData([]);
     setMission(null);

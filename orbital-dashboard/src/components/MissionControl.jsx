@@ -1,10 +1,19 @@
+import { scheduleQuickBurn } from "../services/api";
 /**
  * MissionControl.jsx
  * ──────────────────
- * Collapsible mission control panel (right side of screen).
+ * Collapsible mission control panel (right side of screen) showing:
+ *   - Active CDM warnings: sat/debris pair, risk level, miss distance, TCA countdown
+ *   - Scheduled burns: burn ID, satellite, ΔV, time until burn
+ *   - Satellite health: status, fuel %, DEAD/EOL highlighted
+ *   - Collision flash overlay when a satellite is destroyed
+ *
+ * props:
+ *   mission  — data from /api/mission endpoint (updated every 2s)
+ *   simEpoch — current sim_epoch (for countdowns)
  */
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 
 // ── Colour helpers ────────────────────────────────────────────────────────────
 const RISK_COLOR = {
@@ -76,7 +85,7 @@ function Section({ title, count, color = "#00ccff", children, defaultOpen = true
 }
 
 // ── CDM Warning row ───────────────────────────────────────────────────────────
-function CDMRow({ w }) {
+function CDMRow({ w, simEpoch }) {
   const tca = w.time_to_tca_s;
   const rc  = RISK_COLOR[w.risk_level] || "#ff8800";
   return (
@@ -164,6 +173,7 @@ function SatRow({ s }) {
         {s.status === "DEAD" ? "💀" : s.status === "EOL" ? "⚠️" : "●"} {s.id}
       </span>
       <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        {/* Fuel bar */}
         <div style={{ width: 40, height: 5, background: "rgba(255,255,255,0.1)", borderRadius: 3 }}>
           <div style={{
             width: `${Math.max(0, s.fuel_pct)}%`, height: "100%",
@@ -229,17 +239,134 @@ function CollisionFlash({ collisions, onDismiss }) {
   );
 }
 
+
+// ── Manual Burn Panel ─────────────────────────────────────────────────────────
+function ManualBurnPanel({ satellites }) {
+  const [satId,     setSatId]     = useState("");
+  const [direction, setDirection] = useState("TRANSVERSE");
+  const [dvMs,      setDvMs]      = useState(1.0);
+  const [delayS,    setDelayS]    = useState(15);
+  const [result,    setResult]    = useState(null);
+  const [loading,   setLoading]   = useState(false);
+
+  const nominalSats = (satellites || []).filter(
+    s => s.status !== "DEAD" && s.status !== "EOL"
+  );
+
+  const handleFire = async () => {
+    if (!satId) { setResult({ status: "REJECTED", reject_reason: "Select a satellite first" }); return; }
+    setLoading(true);
+    setResult(null);
+    try {
+      const res = await scheduleQuickBurn(satId, direction, dvMs, delayS);
+      setResult(res);
+    } catch (e) {
+      setResult({ status: "ERROR", reject_reason: e?.response?.data?.detail || e.message });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const inputStyle = {
+    background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.15)",
+    color: "#fff", borderRadius: 4, padding: "4px 6px",
+    fontFamily: "monospace", fontSize: 11, width: "100%", boxSizing: "border-box",
+  };
+  const labelStyle = { color: "#888", fontSize: 10, marginBottom: 2, display: "block" };
+
+  return (
+    <div style={{ marginTop: 4 }}>
+      {/* Satellite selector */}
+      <div style={{ marginBottom: 6 }}>
+        <label style={labelStyle}>Satellite</label>
+        <select value={satId} onChange={e => setSatId(e.target.value)} style={inputStyle}>
+          <option value="">— select —</option>
+          {nominalSats.map(s => (
+            <option key={s.id} value={s.id}>
+              {s.id} ({s.status}) ⛽{s.fuel_pct}%
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* Direction */}
+      <div style={{ marginBottom: 6 }}>
+        <label style={labelStyle}>Direction</label>
+        <select value={direction} onChange={e => setDirection(e.target.value)} style={inputStyle}>
+          <option value="TRANSVERSE">TRANSVERSE (along-track, changes orbit size)</option>
+          <option value="RADIAL">RADIAL (toward/away from Earth)</option>
+          <option value="NORMAL">NORMAL (out-of-plane, changes inclination)</option>
+          <option value="RETROGRADE">RETROGRADE (decelerate, lower orbit)</option>
+        </select>
+      </div>
+
+      {/* ΔV and delay side by side */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>ΔV (m/s, max 15)</label>
+          <input
+            type="number" min={0.1} max={15} step={0.1}
+            value={dvMs}
+            onChange={e => setDvMs(parseFloat(e.target.value) || 1)}
+            style={inputStyle}
+          />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label style={labelStyle}>Delay (s, min 10)</label>
+          <input
+            type="number" min={10} max={3600} step={5}
+            value={delayS}
+            onChange={e => setDelayS(parseFloat(e.target.value) || 15)}
+            style={inputStyle}
+          />
+        </div>
+      </div>
+
+      {/* Fire button */}
+      <button
+        onClick={handleFire}
+        disabled={loading || !satId}
+        style={{
+          width: "100%", padding: "6px 0",
+          background: loading ? "rgba(255,200,0,0.1)" : "rgba(255,200,0,0.15)",
+          border: "1px solid rgba(255,200,0,0.5)",
+          color: "#ffee00", borderRadius: 4,
+          fontFamily: "monospace", fontSize: 11,
+          cursor: loading || !satId ? "not-allowed" : "pointer",
+          fontWeight: "bold",
+        }}
+      >
+        {loading ? "Scheduling…" : "🚀 Schedule Burn"}
+      </button>
+
+      {/* Result */}
+      {result && (
+        <div style={{
+          marginTop: 6, padding: "6px 8px", borderRadius: 4, fontSize: 10,
+          background: result.status === "SCHEDULED"
+            ? "rgba(0,255,150,0.08)" : "rgba(255,50,50,0.08)",
+          border: `1px solid ${result.status === "SCHEDULED" ? "#00ff9944" : "#ff444444"}`,
+          color: result.status === "SCHEDULED" ? "#00ffaa" : "#ff8888",
+        }}>
+          {result.status === "SCHEDULED" ? (
+            <>
+              ✅ Burn scheduled: <b>{result.burn_id}</b><br />
+              ΔV: {result.delta_v_ms} m/s | fires at epoch {result.burn_epoch?.toFixed(0)}s
+            </>
+          ) : (
+            <>❌ {result.status}: {result.reject_reason}</>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main MissionControl component ─────────────────────────────────────────────
 export default function MissionControl({ mission, simEpoch, prevCollisions, onCollisionSeen }) {
   const [collapsed, setCollapsed] = useState(false);
   const [showFlash,  setShowFlash] = useState(false);
-
-  // FIX: prevColRef initialized to 0, not from the prevCollisions prop.
-  // The prop is always prevCollisionsRef.current from SatelliteScene which is
-  // 0 at mount and never triggers a re-render when updated (refs don't cause
-  // re-renders). Initializing from the prop was therefore always 0 anyway but
-  // misleading. Collision detection is self-contained via mission data.
-  const prevColRef = useRef(0);
+  const prevColRef = useRef(prevCollisions);
 
   // Detect new collisions → trigger flash
   useEffect(() => {
@@ -252,9 +379,10 @@ export default function MissionControl({ mission, simEpoch, prevCollisions, onCo
 
   if (!mission) return null;
 
-  const cdmCount  = mission.active_cdm_warnings?.length ?? 0;
-  const burnCount = mission.scheduled_burns?.length ?? 0;
-  const deadCount = mission.dead_satellites?.length ?? 0;
+  const cdmCount   = mission.active_cdm_warnings?.length ?? 0;
+  const burnCount  = mission.scheduled_burns?.length ?? 0;
+  const deadCount  = mission.dead_satellites?.length ?? 0;
+  const critCount  = mission.active_cdm_warnings?.filter(w => w.risk_level === "CRITICAL").length ?? 0;
 
   return (
     <>
@@ -326,11 +454,8 @@ export default function MissionControl({ mission, simEpoch, prevCollisions, onCo
                 ✅ No active conjunction threats
               </div>
             ) : (
-              // FIX: removed unused simEpoch prop from CDMRow — CDMRow uses
-              // w.time_to_tca_s directly from backend, not a client-computed
-              // epoch delta. Passing simEpoch was dead data causing confusion.
               mission.active_cdm_warnings.map((w, i) => (
-                <CDMRow key={`${w.sat_id}-${w.deb_id}`} w={w} />
+                <CDMRow key={i} w={w} simEpoch={simEpoch} />
               ))
             )}
           </Section>
@@ -348,7 +473,7 @@ export default function MissionControl({ mission, simEpoch, prevCollisions, onCo
               </div>
             ) : (
               mission.scheduled_burns.map((b, i) => (
-                <BurnRow key={b.burn_id} b={b} simEpoch={simEpoch} />
+                <BurnRow key={i} b={b} simEpoch={simEpoch} />
               ))
             )}
           </Section>
@@ -364,15 +489,26 @@ export default function MissionControl({ mission, simEpoch, prevCollisions, onCo
               <div style={{ color: "#888", fontSize: 10 }}>No satellites tracked</div>
             ) : (
               <div>
+                {/* Sort: DEAD first, then EOL, then MANEUVERING, then NOMINAL */}
                 {[...mission.satellite_health]
                   .sort((a, b) => {
                     const order = { DEAD: 0, EOL: 1, MANEUVERING: 2, NOMINAL: 3 };
                     return (order[a.status] ?? 4) - (order[b.status] ?? 4);
                   })
-                  .map((s) => <SatRow key={s.id} s={s} />)
+                  .map((s, i) => <SatRow key={i} s={s} />)
                 }
               </div>
             )}
+          </Section>
+
+          {/* ── Manual Burn ── */}
+          <Section
+            title="🎯 Schedule Manual Burn"
+            count={null}
+            color="#ffee00"
+            defaultOpen={false}
+          >
+            <ManualBurnPanel satellites={mission?.satellite_health || []} />
           </Section>
 
           {/* ── Legend ── */}
