@@ -1,11 +1,5 @@
-import SatelliteScene from './components/SatelliteScene';
+import SatelliteScene from "./components/SatelliteScene";
 
-function App() {
-  return (
-    <main>
-      <SatelliteScene />
-    </main>
-  );
+export default function App() {
+  return <SatelliteScene />;
 }
-
-export default App;
