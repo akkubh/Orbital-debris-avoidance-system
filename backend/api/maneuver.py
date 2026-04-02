@@ -14,6 +14,17 @@ FIXES:
   - Rejection reason always returned in response body so frontend can display it
   - LOS rejection includes list of visible stations (or empty list)
   - burnTime helper shows expected format in error messages
+
+  FIX (quick_burn LOS): Ground-station LOS is now a WARNING, not a hard
+  rejection, for /api/maneuver/quick. Auto-evasion (telemetry.py) already
+  handles LOS gracefully via _resolve_evasion_time() — it finds the next
+  window and schedules ahead of it. But manual burns from the control panel
+  were being permanently blocked by the hard LOS check, even when the operator
+  could see the conjunction warning and wanted to act. The burn is now
+  scheduled regardless; a warning is included in the response so the frontend
+  can inform the operator. The /api/maneuver/schedule endpoint retains the
+  hard LOS rejection (advanced users scheduling raw ISO sequences are expected
+  to handle timing themselves).
 """
 
 import logging
@@ -197,12 +208,13 @@ class QuickBurnRequest(BaseModel):
 
 
 class QuickBurnResponse(BaseModel):
-    status:       str
-    burn_id:      str   = ""
-    burn_epoch:   float = 0.0
-    burn_time_iso: str  = ""
-    delta_v_ms:   float = 0.0
-    reject_reason: str  = ""
+    status:        str
+    burn_id:       str   = ""
+    burn_epoch:    float = 0.0
+    burn_time_iso: str   = ""
+    delta_v_ms:    float = 0.0
+    reject_reason: str   = ""
+    los_warning:   bool  = False   # True when burn scheduled despite no GS LOS
 
 
 @router.post("/api/maneuver/quick", response_model=QuickBurnResponse)
@@ -214,6 +226,13 @@ async def quick_burn(payload: QuickBurnRequest):
     direction: RADIAL | TRANSVERSE | NORMAL | RETROGRADE
     delta_v_ms: burn magnitude in m/s (max 15 m/s)
     delay_s: seconds from current sim_epoch to fire the burn (min = SIGNAL_LATENCY)
+
+    LOS NOTE: Ground-station LOS is checked but is NOT a hard blocker here.
+    If the satellite is in blackout, the burn is still scheduled and a
+    los_warning=True flag is returned so the frontend can notify the operator.
+    This matches real-world practice where operators can pre-program burns to
+    execute autonomously during blackout windows. The /api/maneuver/schedule
+    endpoint retains the hard LOS rejection for advanced multi-burn sequences.
     """
     import math
     from physics.maneuver_calc import rtn_to_eci, RTN_DIRECTIONS
@@ -244,27 +263,32 @@ async def quick_burn(payload: QuickBurnRequest):
             reject_reason=f"ΔV {payload.delta_v_ms:.1f} m/s exceeds limit of {MAX_DV_PER_BURN*1000:.0f} m/s"
         )
 
-    delay_s    = max(payload.delay_s, SIGNAL_LATENCY)
-    burn_epoch = state.sim_epoch + delay_s
+    delay_s       = max(payload.delay_s, SIGNAL_LATENCY)
+    burn_epoch    = state.sim_epoch + delay_s
     burn_time_iso = _epoch_to_iso(burn_epoch)
 
-    # LOS check
+    # FIX: LOS is now a WARNING, not a hard rejection.
+    # Previously: if no LOS → return REJECTED immediately → operator can never
+    # schedule a manual burn from the control panel during any blackout window.
+    # Now: log the warning, set los_warning=True, and continue to schedule.
+    # The frontend will display the warning inline in the Manual Burn Panel.
     sim_now_iso = state.sim_time or datetime.now(timezone.utc).isoformat()
-    burn_los, visible = has_line_of_sight(sat.r, sim_now_iso)
-    if not burn_los:
-        return QuickBurnResponse(
-            status="REJECTED",
-            reject_reason=f"{sat_id} is in ground-station blackout. No stations visible."
+    burn_los, _visible = has_line_of_sight(sat.r, sim_now_iso)
+    los_warning = not burn_los
+    if los_warning:
+        log.warning(
+            f"[MANEUVER] {sat_id} in GS blackout — scheduling quick burn anyway "
+            f"(operator override). Burn will execute autonomously at epoch={burn_epoch:.1f}s"
         )
 
     # Convert RTN → ECI
-    sat_pos   = np.asarray(sat.r, dtype=float)
-    sat_vel   = np.asarray(sat.v, dtype=float)
-    rtn_unit  = RTN_DIRECTIONS[direction]
-    dv_rtn    = rtn_unit * dv_kms
-    dv_eci    = rtn_to_eci(dv_rtn, sat_pos, sat_vel)
+    sat_pos  = np.asarray(sat.r, dtype=float)
+    sat_vel  = np.asarray(sat.v, dtype=float)
+    rtn_unit = RTN_DIRECTIONS[direction]
+    dv_rtn   = rtn_unit * dv_kms
+    dv_eci   = rtn_to_eci(dv_rtn, sat_pos, sat_vel)
 
-    # Validate
+    # Validate fuel + cooldown (these remain hard rejections)
     temp_sat = _TempSat(
         wet_mass       = sat.wet_mass,
         fuel_kg        = sat.fuel_kg,
@@ -291,7 +315,12 @@ async def quick_burn(payload: QuickBurnRequest):
     log.info(
         f"Quick burn scheduled: {sat_id} | {burn_id} | "
         f"dir={direction} dv={payload.delta_v_ms:.1f} m/s | "
-        f"epoch={burn_epoch:.1f}s"
+        f"epoch={burn_epoch:.1f}s | los_warning={los_warning}"
+    )
+
+    reject_reason_str = (
+        "Warning: satellite in GS blackout — burn queued for autonomous execution"
+        if los_warning else ""
     )
 
     return QuickBurnResponse(
@@ -300,5 +329,6 @@ async def quick_burn(payload: QuickBurnRequest):
         burn_epoch    = burn_epoch,
         burn_time_iso = burn_time_iso,
         delta_v_ms    = round(math.sqrt(sum(x**2 for x in dv_eci)) * 1000, 3),
-        reject_reason = "",
+        reject_reason = reject_reason_str,
+        los_warning   = los_warning,
     )

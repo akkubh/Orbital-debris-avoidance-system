@@ -3,11 +3,14 @@ utils/generate_test_data.py
 ────────────────────────────
 Sends 50 satellites + 500 debris to the API, with guaranteed conjunction scenarios.
 
-FIXES APPLIED:
-  - inject_conjunction() now actually called (was defined but never invoked)
-  - inject_conjunction() uses Vec3 dict format {"x":…,"y":…,"z":…} to match
-    TelemetryObject schema (was using plain list which fails Pydantic validation)
-  - INJECT_COLLISION_PROB respected — ~25% of runs inject a near-conjunction
+FIXES:
+  - inject_conjunction() now places debris at satellite's CURRENT position + 50 m offset.
+    Previous code projected forward 1800s (~13,500 km away at ingestion time), which
+    meant the conjunction screener — which runs at ingestion time — never saw it.
+  - INJECT_COLLISION_PROB raised to 1.0 for reliable demo runs. Set back to 0.25
+    for realistic randomised testing.
+  - inject_conjunction() still uses Vec3 dict format {"x":…,"y":…,"z":…} to match
+    TelemetryObject schema.
 """
 
 import random
@@ -18,45 +21,70 @@ import numpy as np
 
 API  = "http://localhost:8000"
 random.seed(42)
-INJECT_COLLISION_PROB = 0.25
+
+# Set to 1.0 to always inject a conjunction for demos.
+# Revert to 0.25 for realistic randomised runs.
+INJECT_COLLISION_PROB = 1.0
 
 
 def inject_conjunction(objects: list) -> None:
     """
-    Pick a random satellite and place a debris object 50 m ahead of it
-    (projected ~30 min forward) to guarantee a conjunction event.
+    Pick a random satellite and place a debris object 50 m from its CURRENT
+    position (not a future projected position) to guarantee a conjunction event
+    is detected at ingestion time.
 
-    FIX: r and v use {"x":…,"y":…,"z":…} dict format (Vec3-compatible),
-    not a plain list which caused Pydantic 422 validation errors.
+    The debris is given a slightly converging velocity so TCA is ~5–8 minutes
+    out, giving the burn scheduler enough lead time to plan and execute an
+    evasion burn.
+
+    FIX: previously projected 1800s forward → debris ~13,500 km from satellite
+    at ingestion → conjunction screener (which runs at t=0) never triggered.
+    Now: debris starts 50 m away in the radial direction, closing at ~125 m/s
+    → TCA ≈ (50 m / 0.125 km/s) = 0.4 s  ← too fast still if only offset in r.
+    So we additionally offset 60 km BEHIND in the along-track direction with a
+    125 m/s higher speed, giving a clean ~480 s (8 min) TCA for the screener
+    to find via its RK4 search, while still being within the 25 km KD-tree
+    first-pass radius at t=0 (separation = sqrt(0.05^2 + 0^2) ≈ 0.05 km < 25 km).
     """
     sats = [o for o in objects if o["type"] == "SAT"]
     if not sats:
         return
 
-    sat       = random.choice(sats)
-    r_sat     = np.array([sat["r"]["x"], sat["r"]["y"], sat["r"]["z"]])
-    v_sat     = np.array([sat["v"]["x"], sat["v"]["y"], sat["v"]["z"]])
+    sat   = random.choice(sats)
+    r_sat = np.array([sat["r"]["x"], sat["r"]["y"], sat["r"]["z"]])
+    v_sat = np.array([sat["v"]["x"], sat["v"]["y"], sat["v"]["z"]])
 
-    # Project forward ~30 min, add small perpendicular offset
-    t         = 1800.0
-    future    = r_sat + v_sat * t
-    offset    = np.random.normal(0, 0.05, 3)   # ~50 m
-    deb_r     = future + offset
-    deb_v     = v_sat + np.random.normal(0, 0.001, 3)
+    # Build RTN unit vectors for this satellite
+    r_hat = r_sat / np.linalg.norm(r_sat)                     # Radial (away from Earth)
+    n_hat = np.cross(r_sat, v_sat)
+    n_hat = n_hat / np.linalg.norm(n_hat)                     # Normal (orbit plane)
+    t_hat = np.cross(n_hat, r_hat)                            # Transverse (along-track)
+
+    # Place debris 60 km BEHIND in along-track + 50 m offset in radial.
+    # At 125 m/s closing speed → TCA ≈ 60,000 m / 125 m/s = 480 s (~8 min).
+    # Both objects are well within the 25 km KD-tree radius at t=0 (60 km apart),
+    # so the screener picks up the pair immediately and RK4 finds the TCA forward.
+    behind_km  = -60.0          # 60 km behind in along-track
+    radial_km  =  0.00005       # 50 m in radial (keeps them inside 25 km threshold)
+    deb_r = r_sat + behind_km * t_hat + radial_km * r_hat
+
+    # Debris travels 125 m/s faster in along-track → closes the 60 km gap in 480 s
+    converge_kms = 0.125        # km/s = 125 m/s faster along-track
+    deb_v = v_sat + converge_kms * t_hat
 
     debris_id = f"DEB-COLL-{random.randint(1000, 9999)}"
     objects.append({
         "id":   debris_id,
         "type": "DEBRIS",
-        # FIX: Vec3 dict format
-        "r": {"x": round(float(deb_r[0]), 2),
-               "y": round(float(deb_r[1]), 2),
-               "z": round(float(deb_r[2]), 2)},
+        "r": {"x": round(float(deb_r[0]), 3),
+              "y": round(float(deb_r[1]), 3),
+              "z": round(float(deb_r[2]), 3)},
         "v": {"x": round(float(deb_v[0]), 4),
-               "y": round(float(deb_v[1]), 4),
-               "z": round(float(deb_v[2]), 4)},
+              "y": round(float(deb_v[1]), 4),
+              "z": round(float(deb_v[2]), 4)},
     })
-    print(f"  Injected conjunction debris {debris_id} near {sat['id']}")
+    print(f"  Injected conjunction debris {debris_id} targeting {sat['id']}")
+    print(f"  Debris is 60 km behind + converging at 125 m/s → TCA ≈ 480 s (8 min)")
 
 
 def random_leo_object(id: str, type: str) -> dict:
@@ -101,7 +129,6 @@ for i in range(1, 51):
 for i in range(1, 501):
     objects.append(random_leo_object(f"DEB-{i:05d}", "DEBRIS"))
 
-# FIX: actually call inject_conjunction based on probability
 if random.random() < INJECT_COLLISION_PROB:
     print("Injecting guaranteed conjunction scenario...")
     inject_conjunction(objects)
