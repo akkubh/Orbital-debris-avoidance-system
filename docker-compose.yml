@@ -1,0 +1,118 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Autonomous Constellation Manager (ACM)
+# docker-compose.yml  —  place this file at the repository root
+#
+# Directory layout expected:
+#
+#   ├── Dockerfile
+#   ├── docker-compose.yml          ← this file
+#   ├── backend/
+#   │   ├── main.py
+#   │   ├── requirements.txt
+#   │   ├── api/
+#   │   │   ├── celestrak.py
+#   │   │   ├── maneuver.py
+#   │   │   ├── simulate.py
+#   │   │   └── telemetry.py
+#   │   ├── data/
+#   │   │   └── tle_fetcher.py
+#   │   ├── models/
+#   │   │   ├── schemas.py
+#   │   │   └── state_store.py
+#   │   ├── physics/
+#   │   │   ├── conjunction.py
+#   │   │   ├── ground_station.py
+#   │   │   ├── maneuver_calc.py
+#   │   │   ├── propagator.py
+#   │   │   └── risk_model.py
+#   │   └── utils/
+#   │       ├── generate_test_data.py
+#   │       └── test_conjunction.py
+#   └── frontend/
+#       ├── package.json
+#       ├── vite.config.ts
+#       ├── tsconfig.json
+#       ├── index.html
+#       └── src/
+#           ├── main.tsx
+#           ├── App.jsx
+#           ├── style.css
+#           ├── components/
+#           │   ├── Alerts.jsx
+#           │   ├── Debris.jsx
+#           │   ├── Earth.jsx
+#           │   ├── ManeuverPath.jsx
+#           │   ├── MissionControl.jsx
+#           │   ├── OrbitalShell.tsx
+#           │   ├── Satellites.jsx
+#           │   └── SatelliteScene.tsx
+#           ├── services/
+#           │   └── api.js
+#           └── store/
+#               └── useStore.js
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Backend (FastAPI + Uvicorn) ─────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend
+    container_name: acm-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist sim state across restarts
+      - acm-data:/data
+    environment:
+      ACM_DATA_DIR: /data
+      # Override to add production origins, e.g. "https://acm.example.com"
+      ACM_CORS_ORIGINS: >-
+        http://localhost:5173,
+        http://localhost:3000,
+        http://127.0.0.1:5173,
+        http://127.0.0.1:3000,
+        http://localhost:8000
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Frontend dev server (optional – only used in development) ───────────────
+  # Remove or comment this service out for a pure-production deployment
+  # where the built frontend is served by the backend via StaticFiles.
+  frontend-dev:
+    image: node:20-alpine
+    container_name: acm-frontend-dev
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    volumes:
+      - ./frontend:/app
+      # Prevent host node_modules from shadowing the container's
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    environment:
+      # Point Vite's dev proxy (if configured) to the backend container
+      VITE_API_BASE: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    profiles:
+      # Only started when explicitly requested:
+      #   docker compose --profile dev up
+      - dev
+
+
+volumes:
+  # Named volume so sim_state.json survives container restarts / re-builds
+  acm-data:
+    driver: local

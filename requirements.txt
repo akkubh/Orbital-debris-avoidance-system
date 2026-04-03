@@ -5,3 +5,4 @@ scipy==1.13.1
 pydantic==2.7.1
 sgp4
 requests
+fastapi==0.111.*

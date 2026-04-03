@@ -1,30 +1,7 @@
 """
 api/maneuver.py
-━━━━━━━━━━━━━━━
-POST /api/maneuver/schedule — validate and queue a maneuver burn sequence.
-POST /api/maneuver/quick    — convenience endpoint: schedule a burn N seconds
-                              from NOW in sim time, in a named RTN direction.
-                              Makes it easy to trigger from the frontend without
-                              knowing the exact ISO timestamp format.
 
-FIXES:
-  - _TempSat defined at module level (not redefined every loop iteration)
-  - EOL satellites blocked (graveyard burn pending, near-zero fuel)
-  - /api/maneuver/quick endpoint added for frontend use
-  - Rejection reason always returned in response body so frontend can display it
-  - LOS rejection includes list of visible stations (or empty list)
-  - burnTime helper shows expected format in error messages
 
-  FIX (quick_burn LOS): Ground-station LOS is now a WARNING, not a hard
-  rejection, for /api/maneuver/quick. Auto-evasion (telemetry.py) already
-  handles LOS gracefully via _resolve_evasion_time() — it finds the next
-  window and schedules ahead of it. But manual burns from the control panel
-  were being permanently blocked by the hard LOS check, even when the operator
-  could see the conjunction warning and wanted to act. The burn is now
-  scheduled regardless; a warning is included in the response so the frontend
-  can inform the operator. The /api/maneuver/schedule endpoint retains the
-  hard LOS rejection (advanced users scheduling raw ISO sequences are expected
-  to handle timing themselves).
 """
 
 import logging
@@ -267,11 +244,7 @@ async def quick_burn(payload: QuickBurnRequest):
     burn_epoch    = state.sim_epoch + delay_s
     burn_time_iso = _epoch_to_iso(burn_epoch)
 
-    # FIX: LOS is now a WARNING, not a hard rejection.
-    # Previously: if no LOS → return REJECTED immediately → operator can never
-    # schedule a manual burn from the control panel during any blackout window.
-    # Now: log the warning, set los_warning=True, and continue to schedule.
-    # The frontend will display the warning inline in the Manual Burn Panel.
+  
     sim_now_iso = state.sim_time or datetime.now(timezone.utc).isoformat()
     burn_los, _visible = has_line_of_sight(sat.r, sim_now_iso)
     los_warning = not burn_los
